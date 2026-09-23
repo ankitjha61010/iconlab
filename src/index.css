@@ -158,14 +158,14 @@ input[type='range'] {
   accent-color: var(--primary);
 }
 
-/* Editor artboards use fixed light colors in both themes, like a design canvas. */
+/* Editor artboards — use CSS variables so they adapt to dark mode. */
 .stage-checker {
-  background-color: #ffffff;
+  background-color: var(--checker-a);
   background-image:
-    linear-gradient(45deg, #eceef4 25%, transparent 25%),
-    linear-gradient(-45deg, #eceef4 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #eceef4 75%),
-    linear-gradient(-45deg, transparent 75%, #eceef4 75%);
+    linear-gradient(45deg, var(--checker-b) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--checker-b) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--checker-b) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--checker-b) 75%);
   background-size: 20px 20px;
   background-position:
     0 0,
@@ -174,10 +174,10 @@ input[type='range'] {
     -10px 0;
 }
 .stage-grid {
-  background-color: #ffffff;
+  background-color: var(--checker-a);
   background-image:
-    linear-gradient(#e9eaf2 1px, transparent 1px),
-    linear-gradient(90deg, #e9eaf2 1px, transparent 1px);
+    linear-gradient(var(--checker-b) 1px, transparent 1px),
+    linear-gradient(90deg, var(--checker-b) 1px, transparent 1px);
   background-size: 16px 16px;
   background-position: center;
 }

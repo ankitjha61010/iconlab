@@ -6,6 +6,7 @@
  * 1. an automatic pass that flood-fills from the image border using the
  *    detected background color, then
  * 2. manual "remove"/"restore" clicks (magic-wand style), in order.
+ *    ("fill" clicks recolor the cut-out afterwards; see applyFills.)
  *
  * Edge pixels next to removed areas get partial alpha based on how close they
  * are to the removed color, and that color is un-mixed from them so no halo
@@ -27,7 +28,9 @@ export interface RGB {
 
 export type RemovalOp =
   | { kind: 'remove'; x: number; y: number; tolerance: number; contiguous: boolean }
-  | { kind: 'restore'; x: number; y: number; tolerance: number };
+  | { kind: 'restore'; x: number; y: number; tolerance: number }
+  /** Paints a visible region a new color (applied to the cut-out, not the mask). */
+  | { kind: 'fill'; x: number; y: number; tolerance: number; color: RGB };
 
 export interface RemovalSettings {
   auto: boolean;
@@ -39,6 +42,8 @@ export interface RemovalSettings {
   removeHoles: boolean;
   /** Enclosed areas up to this % of the image are treated as holes. */
   holeSize: number;
+  /** Automatically remove container/badge shapes surrounding inner icon elements. */
+  removeContainer: boolean;
 }
 
 export const MAX_WORKING_SIZE = 2048;
@@ -261,6 +266,46 @@ function removeEnclosed(img: WorkingImage, owner: Uint16Array, target: RGB, maxD
   return { removed, kept };
 }
 
+export function estimateContainerColor(img: WorkingImage, owner: Uint16Array): { color: RGB; seeds: number[] } | null {
+  const { width, height, data } = img;
+  const n = width * height;
+  const seeds: number[] = [];
+  const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
+
+  for (let p = 0; p < n; p++) {
+    if (owner[p] !== 0) continue;
+    const x = p % width;
+    const y = Math.floor(p / width);
+    // Check if this kept pixel touches a removed pixel or border
+    const touchesEdge =
+      x === 0 ||
+      x === width - 1 ||
+      y === 0 ||
+      y === height - 1 ||
+      owner[p - 1] > 0 ||
+      owner[p + 1] > 0 ||
+      owner[p - width] > 0 ||
+      owner[p + width] > 0;
+    if (touchesEdge) {
+      seeds.push(p);
+      const i = p * 4;
+      const key = ((data[i] >> 4) << 8) | ((data[i + 1] >> 4) << 4) | (data[i + 2] >> 4);
+      const b = buckets.get(key) ?? { n: 0, r: 0, g: 0, b: 0 };
+      b.n++;
+      b.r += data[i];
+      b.g += data[i + 1];
+      b.b += data[i + 2];
+      buckets.set(key, b);
+    }
+  }
+
+  if (seeds.length === 0) return null;
+  let best: { n: number; r: number; g: number; b: number } | null = null;
+  for (const b of buckets.values()) if (!best || b.n > best.n) best = b;
+  if (!best || best.n < seeds.length * 0.15) return null;
+  return { color: { r: best.r / best.n, g: best.g / best.n, b: best.b / best.n }, seeds };
+}
+
 export function buildMask(img: WorkingImage, settings: RemovalSettings, ops: RemovalOp[], autoColor: RGB | null): Mask {
   const owner = new Uint16Array(img.width * img.height);
   const colors: RGB[] = [];
@@ -277,6 +322,16 @@ export function buildMask(img: WorkingImage, settings: RemovalSettings, ops: Rem
     }
   }
 
+  if (settings.removeContainer) {
+    const container = estimateContainerColor(img, owner);
+    if (container) {
+      colors.push(container.color);
+      const id = colors.length;
+      const dist = toDistance(settings.tolerance);
+      flood(img, container.seeds, container.color, dist, true, (p) => (owner[p] = id));
+    }
+  }
+
   for (const op of ops.slice(-MAX_OPS)) {
     const x = Math.round(op.x);
     const y = Math.round(op.y);
@@ -287,7 +342,7 @@ export function buildMask(img: WorkingImage, settings: RemovalSettings, ops: Rem
       colors.push(color);
       const id = colors.length;
       flood(img, [seed], color, toDistance(op.tolerance), op.contiguous, (p) => (owner[p] = id));
-    } else {
+    } else if (op.kind === 'restore') {
       flood(img, [seed], color, toDistance(op.tolerance), true, (p) => (owner[p] = 0));
     }
   }
@@ -350,6 +405,62 @@ export function renderCutout(img: WorkingImage, mask: Mask, settings: RemovalSet
     }
   }
   return out;
+}
+
+/**
+ * Replays "fill" ops on the cut-out: flood-fills the clicked region (by the
+ * original colors, staying inside visible pixels) with the chosen color.
+ * Anti-aliased pixels on the region's border are blended so edges stay smooth.
+ */
+export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[]) {
+  const { width, height } = img;
+  const px = cutout.data;
+  for (const op of ops.slice(-MAX_OPS)) {
+    if (op.kind !== 'fill') continue;
+    const x = Math.round(op.x);
+    const y = Math.round(op.y);
+    if (x < 0 || y < 0 || x >= width || y >= height) continue;
+    const seed = y * width + x;
+    if (px[seed * 4 + 3] < TRANSPARENT) continue;
+    const target = pixelColor(img, x, y);
+    const dist = toDistance(op.tolerance);
+    const limit = dist * dist;
+    const filled = new Uint8Array(width * height);
+    const stack = new Int32Array(width * height);
+    let top = 0;
+    filled[seed] = 1;
+    stack[top++] = seed;
+    while (top > 0) {
+      const p = stack[--top];
+      const i = p * 4;
+      px[i] = op.color.r;
+      px[i + 1] = op.color.g;
+      px[i + 2] = op.color.b;
+      const cx = p % width;
+      const push = (q: number) => {
+        if (filled[q] || px[q * 4 + 3] < TRANSPARENT || distSq(img.data, q * 4, target) > limit) return;
+        filled[q] = 1;
+        stack[top++] = q;
+      };
+      if (cx > 0) push(p - 1);
+      if (cx < width - 1) push(p + 1);
+      if (p >= width) push(p - width);
+      if (p < width * (height - 1)) push(p + width);
+    }
+    // Blend the 1px border by how close each pixel is to the filled color.
+    for (let p = 0; p < filled.length; p++) {
+      if (filled[p] || px[p * 4 + 3] < TRANSPARENT) continue;
+      const cx = p % width;
+      const touches =
+        (cx > 0 && filled[p - 1]) || (cx < width - 1 && filled[p + 1]) || (p >= width && filled[p - width]) || (p < width * (height - 1) && filled[p + width]);
+      if (!touches) continue;
+      const i = p * 4;
+      const t = Math.max(0, 1 - Math.sqrt(distSq(img.data, i, target)) / (dist * 3));
+      px[i] += (op.color.r - px[i]) * t;
+      px[i + 1] += (op.color.g - px[i + 1]) * t;
+      px[i + 2] += (op.color.b - px[i + 2]) * t;
+    }
+  }
 }
 
 export function countRemoved(cutout: ImageData) {

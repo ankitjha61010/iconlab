@@ -8,12 +8,16 @@ interface ColorPickerProps {
   swatches?: string[];
   disabled?: boolean;
   compact?: boolean;
+  /** If provided, a checkerboard "transparent" swatch is prepended and calls this when clicked. */
+  onTransparent?: () => void;
+  /** Whether the transparent swatch should appear selected/active. */
+  transparentActive?: boolean;
 }
 
 export const DEFAULT_SWATCHES = ['#000000', '#ffffff', '#5b4cf0', '#1ea7f0', '#12b886', '#f59f00', '#f03e3e', '#e64980', '#495057'];
 
 /** Native color picker + editable HEX field + quick swatches. */
-export function ColorPicker({ label, value, onChange, swatches = DEFAULT_SWATCHES, disabled, compact }: ColorPickerProps) {
+export function ColorPicker({ label, value, onChange, swatches = DEFAULT_SWATCHES, disabled, compact, onTransparent, transparentActive }: ColorPickerProps) {
   const id = useId();
   const [text, setText] = useState(value.toUpperCase());
   const invalid = !isValidHex(text);
@@ -28,6 +32,8 @@ export function ColorPicker({ label, value, onChange, swatches = DEFAULT_SWATCHE
     setText(next.toUpperCase());
     if (isValidHex(next)) onChange(normalizeColor(next));
   };
+
+  const showSwatches = swatches.length > 0 || Boolean(onTransparent);
 
   return (
     <div className={disabled ? 'pointer-events-none opacity-50' : ''}>
@@ -71,10 +77,46 @@ export function ColorPicker({ label, value, onChange, swatches = DEFAULT_SWATCHE
         />
       </div>
       {invalid && <p className="mt-1 text-xs text-danger">Enter a HEX color like #1A2B3C</p>}
-      {swatches.length > 0 && (
+      {showSwatches && (
         <div className="mt-2.5 flex flex-wrap gap-1.5" role="group" aria-label={`${label} presets`}>
+          {/* Transparent / checkerboard swatch */}
+          {onTransparent && (
+            <button
+              type="button"
+              onClick={onTransparent}
+              aria-label="Transparent"
+              aria-pressed={transparentActive}
+              title="Transparent"
+              className={`relative h-6 w-6 overflow-hidden rounded-full border border-border transition-transform hover:scale-110 ${
+                transparentActive ? 'ring-2 ring-primary ring-offset-2 ring-offset-surface' : ''
+              }`}
+            >
+              {/* Mini checkerboard pattern drawn with two pseudo-CSS triangles via a linear gradient */}
+              <span
+                className="absolute inset-0"
+                aria-hidden="true"
+                style={{
+                  backgroundImage:
+                    'linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%)',
+                  backgroundSize: '6px 6px',
+                  backgroundPosition: '0 0, 0 3px, 3px -3px, -3px 0',
+                  backgroundColor: '#fff',
+                }}
+              />
+              {/* Diagonal strike-through to signal "none / remove" */}
+              <span
+                className="absolute inset-0 flex items-center justify-center"
+                aria-hidden="true"
+                style={{
+                  background:
+                    'linear-gradient(to top right, transparent calc(50% - 0.5px), #e03131 calc(50% - 0.5px), #e03131 calc(50% + 0.5px), transparent calc(50% + 0.5px))',
+                }}
+              />
+            </button>
+          )}
+
           {swatches.map((swatch) => {
-            const selected = normalizeColor(swatch) === normalizeColor(value);
+            const selected = !transparentActive && normalizeColor(swatch) === normalizeColor(value);
             return (
               <button
                 key={swatch}

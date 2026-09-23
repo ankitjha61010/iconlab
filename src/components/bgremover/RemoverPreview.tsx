@@ -1,9 +1,47 @@
-import { useEffect, useRef, type MouseEvent } from 'react';
-import { Eraser, Grid3x3, Moon, Paintbrush, Square, Sun } from 'lucide-react';
-import { composeImage, type Bounds, type ComposeLayout, type ComposeOptions } from '../../utils/imageCompose';
+import { type JSX, useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  Eraser,
+  Grid3x3,
+  Group,
+  Moon,
+  Move,
+  PaintBucket,
+  Paintbrush,
+  Redo2,
+  RotateCcw,
+  Square,
+  Sun,
+  Trash2,
+  Type,
+  Undo2,
+  Ungroup,
+} from 'lucide-react';
+import {
+  IDENTITY_TRANSFORM,
+  alignLayer,
+  composeImage,
+  hitTest,
+  layerBox,
+  screenToLayerDelta,
+  toSourcePoint,
+  type Align,
+  type Bounds,
+  type ComposeLayout,
+  type ComposeOptions,
+  type ImageTransform,
+  type TextItem,
+} from '../../utils/imageCompose';
+import type { LayerSet } from '../../utils/imageLayers';
 
 export type PreviewStage = 'checker' | 'grid' | 'light' | 'dark';
-export type PickTool = 'remove' | 'restore';
+/** 'edit' moves / resizes / rotates the subject; the others are click-a-region tools. */
+export type PickTool = 'edit' | 'remove' | 'restore' | 'fill';
 export type PreviewView = 'result' | 'original';
 
 const STAGES = [
@@ -14,6 +52,8 @@ const STAGES = [
 ] as const;
 
 const PREVIEW_SIZE = 1000;
+/** Small uploads are scaled up to at least this size so they aren't a thumbnail in the stage. */
+const MIN_PREVIEW_SIZE = 560;
 
 interface RemoverPreviewProps {
   cutout: ImageData;
@@ -26,57 +66,451 @@ interface RemoverPreviewProps {
   onStageChange: (stage: PreviewStage) => void;
   tool: PickTool;
   onToolChange: (tool: PickTool) => void;
+  fillColor: string;
+  onFillColorChange: (color: string) => void;
   onPick: (x: number, y: number) => void;
+  /** `group` merges a whole drag gesture into one undo step. */
+  onTransform: (patch: Partial<ImageTransform>, group?: string) => void;
+  /** Edit-tool selection: an element (text line, shape) index, the whole image, an added text, or nothing. */
+  selected: Selection;
+  onSelect: (target: Selection) => void;
+  onLayerTransform: (i: number, patch: Partial<ImageTransform>, group?: string) => void;
+  onDeleteLayer: (i: number) => void;
+  onTextChange: (id: string, patch: Partial<TextItem>, group?: string) => void;
+  /** Adds a text; with `hide`, element `hide` is deleted in the same step (replace). */
+  onAddText: (props?: Partial<TextItem>, hide?: number) => void;
+  onDeleteText: (id: string) => void;
+  /** Break an element into its separate letters / shapes, or join split letters back. */
+  onSplit: (i: number) => void;
+  onJoin: (i: number) => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
   processing: boolean;
 }
 
+const TOOLS = [
+  { value: 'edit', label: 'Edit image', title: 'Move, resize and rotate the image', icon: <Move size={14} aria-hidden="true" /> },
+  { value: 'remove', label: 'Erase area', title: 'Click an area to remove it', icon: <Eraser size={14} aria-hidden="true" /> },
+  { value: 'restore', label: 'Restore area', title: 'Click an area to bring it back', icon: <Paintbrush size={14} aria-hidden="true" /> },
+  { value: 'fill', label: 'Fill area', title: 'Click an area to fill it with a color', icon: <PaintBucket size={14} aria-hidden="true" /> },
+] as const;
+
+const TIPS: Record<PickTool, string> = {
+  edit: 'Click a text or shape to select it, then drag to move, drag a corner to resize or the round handle to rotate (Shift snaps to 15°). Double-click a word to move its letters one by one. Del deletes the selection; “Replace with text” swaps it for your own text. Use “Whole image” to move everything; Esc deselects.',
+  remove: 'Click any leftover background to erase it.',
+  restore: 'Click a part that was removed by mistake to bring it back.',
+  fill: 'Click one part of the image to paint it with the chosen color.',
+};
+
+const CORNERS = [
+  { key: 'nw', className: '-left-1.5 -top-1.5 cursor-nwse-resize' },
+  { key: 'ne', className: '-right-1.5 -top-1.5 cursor-nesw-resize' },
+  { key: 'sw', className: '-bottom-1.5 -left-1.5 cursor-nesw-resize' },
+  { key: 'se', className: '-bottom-1.5 -right-1.5 cursor-nwse-resize' },
+] as const;
+
+const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n));
+const normalizeAngle = (deg: number) => ((((deg + 180) % 360) + 360) % 360) - 180;
+let gestureId = 0;
+
+export type Selection = number | 'all' | `text:${string}` | null;
+type Target = Exclude<Selection, null>;
+const textIdOf = (t: Selection) => (typeof t === 'string' && t.startsWith('text:') ? t.slice(5) : null);
+
+/** Most common color of element `i` (for text that replaces it). */
+function layerColor(cutout: ImageData, set: LayerSet, i: number) {
+  const counts = new Map<number, { n: number; r: number; g: number; b: number }>();
+  const L = set.layers[i];
+  const d = cutout.data;
+  for (let y = L.y; y < L.y + L.h; y++) {
+    for (let x = L.x; x < L.x + L.w; x++) {
+      const p = y * set.width + x;
+      if (set.labels[p] !== i || d[p * 4 + 3] < 200) continue;
+      const [r, g, b] = [d[p * 4], d[p * 4 + 1], d[p * 4 + 2]];
+      const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+      const c = counts.get(key) ?? { n: 0, r: 0, g: 0, b: 0 };
+      c.n++;
+      c.r += r;
+      c.g += g;
+      c.b += b;
+      counts.set(key, c);
+    }
+  }
+  let best: { n: number; r: number; g: number; b: number } | null = null;
+  for (const c of counts.values()) if (!best || c.n > best.n) best = c;
+  if (!best) return '#111827';
+  return `#${[best.r, best.g, best.b].map((v) => Math.round(v / best!.n).toString(16).padStart(2, '0')).join('')}`;
+}
+interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotate: number;
+}
+
+const ALIGNS: Array<{ value: Align; label: string; icon: JSX.Element }> = [
+  { value: 'left', label: 'Align left', icon: <AlignStartVertical size={15} /> },
+  { value: 'center', label: 'Align center', icon: <AlignCenterVertical size={15} /> },
+  { value: 'right', label: 'Align right', icon: <AlignEndVertical size={15} /> },
+  { value: 'top', label: 'Align top', icon: <AlignStartHorizontal size={15} /> },
+  { value: 'middle', label: 'Align middle', icon: <AlignCenterHorizontal size={15} /> },
+  { value: 'bottom', label: 'Align bottom', icon: <AlignEndHorizontal size={15} /> },
+];
+
+/** Is output point `p` inside the (rotated) box? */
+function insideBox(b: Box, px: number, py: number) {
+  const dx = px - b.x;
+  const dy = py - b.y;
+  const cos = Math.cos(-b.rotate);
+  const sin = Math.sin(-b.rotate);
+  return Math.abs(dx * cos - dy * sin) <= b.w / 2 && Math.abs(dx * sin + dy * cos) <= b.h / 2;
+}
+
 export function RemoverPreview(props: RemoverPreviewProps) {
-  const { cutout, bounds, options, originalUrl, view, stage, tool, onPick, processing } = props;
+  const { cutout, bounds, options, originalUrl, view, stage, tool, onPick, onTransform, onLayerTransform, onTextChange, onSelect, selected, processing } =
+    props;
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const layoutRef = useRef<ComposeLayout | null>(null);
+  const [layout, setLayout] = useState<ComposeLayout | null>(null);
+  const transform = options.transform ?? IDENTITY_TRANSFORM;
 
   useEffect(() => {
     if (!canvasRef.current) return;
     const longest = Math.max(cutout.width, cutout.height);
-    const { layout } = composeImage(cutout, bounds, { ...options, size: Math.min(PREVIEW_SIZE, longest) }, canvasRef.current);
-    layoutRef.current = layout;
+    // Render the canvas with a transparent background — the background colour
+    // is shown via the stage div (filling the entire preview area). A knockout
+    // needs the real background on the canvas so the cut-out shape shows
+    // through to the checkerboard. We also skip the corner-radius clip here;
+    // it only matters on export.
+    const { layout } = composeImage(
+      cutout,
+      bounds,
+      {
+        ...options,
+        background: options.knockout ? options.background : null,
+        radius: 0, // no clipping in preview; applied only on export
+        size: Math.min(PREVIEW_SIZE, Math.max(MIN_PREVIEW_SIZE, longest)),
+      },
+      canvasRef.current,
+    );
+    setLayout(layout);
   }, [cutout, bounds, options]);
 
+  const editing = tool === 'edit' && view === 'result' && layout !== null;
+
+  const { onDeleteLayer, onDeleteText } = props;
+  // Esc drops the selection; Delete / Backspace removes the selected element or text.
+  useEffect(() => {
+    if (!editing || selected === null) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') onSelect(null);
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      const id = textIdOf(selected);
+      if (typeof selected === 'number') onDeleteLayer(selected);
+      else if (id) onDeleteText(id);
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editing, selected, onSelect, onDeleteLayer, onDeleteText]);
+
+  /** Pointer position in output-canvas px. */
+  const canvasPoint = (clientX: number, clientY: number) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return { x: ((clientX - rect.left) / rect.width) * layout!.width, y: ((clientY - rect.top) / rect.height) * layout!.height, rect };
+  };
+
   const onClick = (e: MouseEvent<HTMLCanvasElement>) => {
-    const layout = layoutRef.current;
-    const canvas = canvasRef.current;
-    if (!layout || !canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const cx = ((e.clientX - rect.left) / rect.width) * canvas.width;
-    const cy = ((e.clientY - rect.top) / rect.height) * canvas.height;
-    const x = (cx - layout.offsetX) / layout.scale;
-    const y = (cy - layout.offsetY) / layout.scale;
+    if (tool === 'edit' || !layout) return;
+    const p = canvasPoint(e.clientX, e.clientY);
+    const { x, y } = toSourcePoint(layout, p.x, p.y);
     if (x >= 0 && y >= 0 && x < cutout.width && y < cutout.height) onPick(x, y);
   };
 
+  const textOf = (target: Target) => {
+    const id = textIdOf(target);
+    return id ? (options.texts?.find((t) => t.id === id) ?? null) : null;
+  };
+  const boxOf = (target: Target): Box => {
+    if (typeof target === 'number') return layerBox(layout!, target);
+    const id = textIdOf(target);
+    if (id) return layout!.texts.find((t) => t.id === id) ?? { x: 0, y: 0, w: 0, h: 0, rotate: 0 };
+    const k = layout!.subjectW / layout!.box.w;
+    let ox = (bounds.x + bounds.w / 2 - (layout!.box.x + layout!.box.w / 2)) * k;
+    let oy = (bounds.y + bounds.h / 2 - (layout!.box.y + layout!.box.h / 2)) * k;
+    if (layout!.flipX) ox = -ox;
+    if (layout!.flipY) oy = -oy;
+    const cos = Math.cos(layout!.rotate);
+    const sin = Math.sin(layout!.rotate);
+    return { x: layout!.centerX + ox * cos - oy * sin, y: layout!.centerY + ox * sin + oy * cos, w: bounds.w * k, h: bounds.h * k, rotate: layout!.rotate };
+  };
+  /** Position / size / angle of any target in one shape; for texts `zoom` is the font size. */
+  const transformOf = (target: Target): ImageTransform => {
+    if (typeof target === 'number') return layout?.layerTransforms[target] ?? IDENTITY_TRANSFORM;
+    const text = textOf(target);
+    if (text) return { ...IDENTITY_TRANSFORM, x: text.x, y: text.y, zoom: text.size, rotate: text.rotate };
+    return transform;
+  };
+  const apply = (target: Target, patch: Partial<ImageTransform>, group?: string) => {
+    if (typeof target === 'number') return onLayerTransform(target, patch, group);
+    const id = textIdOf(target);
+    if (!id) return onTransform(patch, group);
+    const { zoom, ...rest } = patch;
+    const t: Partial<TextItem> = {};
+    if (rest.x !== undefined) t.x = rest.x;
+    if (rest.y !== undefined) t.y = rest.y;
+    if (rest.rotate !== undefined) t.rotate = rest.rotate;
+    if (zoom !== undefined) t.size = zoom;
+    onTextChange(id, t, group);
+  };
+  /** Whole image and texts are positioned in canvas fractions; elements in source px. */
+  const inFractions = (target: Target) => typeof target !== 'number';
+
+  /** Lines a text up with an edge or the center of the canvas. */
+  const alignText = (target: Target, align: Align): Partial<ImageTransform> => {
+    const b = boxOf(target);
+    const ex = (Math.abs(b.w * Math.cos(b.rotate)) + Math.abs(b.h * Math.sin(b.rotate))) / 2 / layout!.width;
+    const ey = (Math.abs(b.w * Math.sin(b.rotate)) + Math.abs(b.h * Math.cos(b.rotate))) / 2 / layout!.height;
+    const at = { left: { x: ex }, center: { x: 0.5 }, right: { x: 1 - ex }, top: { y: ey }, middle: { y: 0.5 }, bottom: { y: 1 - ey } };
+    return at[align];
+  };
+
+  /** Deletes element `i` and puts editable text in its place, matching its position, angle, size and color. */
+  const replaceWithText = (i: number) => {
+    if (!layout?.layers) return;
+    const b = layerBox(layout, i);
+    props.onAddText(
+      {
+        text: 'New text',
+        x: b.x / layout.width,
+        y: b.y / layout.height,
+        // The drawn letters are roughly 0.72 of the font size tall.
+        size: clamp(b.h / 0.72 / layout.height, 0.02, 0.8),
+        rotate: Math.round((b.rotate * 180) / Math.PI),
+        color: layerColor(cutout, layout.layers, i),
+      },
+      i,
+    );
+  };
+
+  /** Drag handling: move the body, resize from corners, rotate from the top handle. */
+  const startGesture = (mode: 'move' | 'scale' | 'rotate', target: Target, e: ReactPointerEvent<HTMLElement>) => {
+    if (!layout || e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const { rect } = canvasPoint(e.clientX, e.clientY);
+    const toOutput = layout.width / rect.width;
+    const box = boxOf(target);
+    const cx = rect.left + box.x / toOutput;
+    const cy = rect.top + box.y / toOutput;
+    const start = { ...transformOf(target) };
+    const startLayout = layout;
+    const startDist = Math.max(1, Math.hypot(e.clientX - cx, e.clientY - cy));
+    const startAngle = Math.atan2(e.clientY - cy, e.clientX - cx);
+    // An element inside a flipped image turns the other way on screen.
+    const spin = typeof target === 'number' && layout.flipX !== layout.flipY ? -1 : 1;
+    const isText = textIdOf(target) !== null;
+    const group = `@gesture:${++gestureId}`;
+
+    const onMove = (ev: PointerEvent) => {
+      if (mode === 'move') {
+        const dx = ev.clientX - e.clientX;
+        const dy = ev.clientY - e.clientY;
+        if (inFractions(target)) {
+          const [lo, hi] = isText ? [0, 1] : [-1, 1];
+          apply(target, { x: clamp(start.x + dx / rect.width, lo, hi), y: clamp(start.y + dy / rect.height, lo, hi) }, group);
+        } else {
+          const d = screenToLayerDelta(startLayout, dx * toOutput, dy * toOutput);
+          apply(target, { x: start.x + d.x, y: start.y + d.y }, group);
+        }
+      } else if (mode === 'scale') {
+        const dist = Math.hypot(ev.clientX - cx, ev.clientY - cy);
+        apply(target, { zoom: isText ? clamp(start.zoom * (dist / startDist), 0.01, 1) : clamp(start.zoom * (dist / startDist), 0.1, 4) }, group);
+      } else {
+        const angle = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+        let rotate = start.rotate + (spin * (angle - startAngle) * 180) / Math.PI;
+        rotate = ev.shiftKey ? Math.round(rotate / 15) * 15 : Math.round(rotate);
+        apply(target, { rotate: normalizeAngle(rotate) }, group);
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  /**
+   * The element at an output point: the one whose pixels are there, else the
+   * smallest element box around it (so the gaps in and between thin letters
+   * still pick the letter / word), else −1.
+   */
+  const visibleLayer = (i: number) => layout?.layers?.layers[i]?.selectable && !layout.layerTransforms[i]?.hidden;
+  const pickLayer = (x: number, y: number) => {
+    const set = layout?.layers;
+    if (!set) return -1;
+    const hit = hitTest(layout, x, y).layer;
+    if (hit >= 0 && visibleLayer(hit)) return hit;
+    let best = -1;
+    let bestArea = Infinity;
+    set.layers.forEach((_, i) => {
+      if (!visibleLayer(i)) return;
+      const b = boxOf(i);
+      if (b.w * b.h < bestArea && insideBox(b, x, y)) {
+        best = i;
+        bestArea = b.w * b.h;
+      }
+    });
+    return best;
+  };
+
+  /** Edit tool: pick what's under the pointer and start dragging it straight away. Elements always win over the whole image. */
+  const onCanvasPointerDown = (e: ReactPointerEvent<HTMLElement>) => {
+    if (!editing || e.button !== 0) return;
+    const p = canvasPoint(e.clientX, e.clientY);
+    // Added texts sit on top, so they are picked first (last drawn first).
+    const text = [...layout.texts].reverse().find((t) => insideBox(t, p.x, p.y));
+    if (text) {
+      onSelect(`text:${text.id}`);
+      return startGesture('move', `text:${text.id}`, e);
+    }
+    const hit = pickLayer(p.x, p.y);
+    if (hit >= 0) {
+      onSelect(hit);
+      return startGesture('move', hit, e);
+    }
+    if (selected === 'all' && insideBox(boxOf('all'), p.x, p.y)) return startGesture('move', 'all', e);
+    onSelect(null);
+  };
+
+  /** Double-click drills into an element: its letters / shapes become separately movable. */
+  const onDoubleClick = (e: MouseEvent<HTMLElement>) => {
+    if (!editing) return;
+    const p = canvasPoint(e.clientX, e.clientY);
+    if (layout.texts.some((t) => insideBox(t, p.x, p.y))) return document.getElementById('text-content')?.focus();
+    const hit = pickLayer(p.x, p.y);
+    if (hit >= 0 && layout.layers?.layers[hit]?.splitAnchor == null) props.onSplit(hit);
+  };
+
+  const onKeyNudge = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (!editing || selected === null) return;
+    const moves: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    const move = moves[e.key];
+    if (!move) return;
+    e.preventDefault();
+    const px = (e.shiftKey ? 0.05 : 0.005) * layout.width;
+    const t = transformOf(selected);
+    if (inFractions(selected)) {
+      apply(selected, { x: clamp(t.x + (move[0] * px) / layout.width, -1, 1), y: clamp(t.y + (move[1] * px) / layout.height, -1, 1) }, `${selected}:nudge`);
+    } else {
+      const d = screenToLayerDelta(layout, move[0] * px, move[1] * px);
+      apply(selected, { x: t.x + d.x, y: t.y + d.y }, `layer:${selected}:nudge`);
+    }
+  };
+
   const stageClass = STAGES.find((s) => s.value === stage)!.className;
+
+  // When a solid background colour is chosen, override the stage background so
+  // the chosen colour fills the *entire* preview area behind the transparent canvas.
+  const hasBackground = Boolean(options.background) && !options.knockout;
+  const stageStyle = hasBackground ? { backgroundColor: options.background as string } : undefined;
+  const selectable = editing && layout.layers ? layout.layers.layers.flatMap((_, i) => (visibleLayer(i) ? [i] : [])) : [];
+  const selectedText = selected !== null ? textOf(selected) : null;
+
+  const boxStyle = (b: Box) => ({
+    left: `${(b.x / layout!.width) * 100}%`,
+    top: `${(b.y / layout!.height) * 100}%`,
+    width: `${(b.w / layout!.width) * 100}%`,
+    height: `${(b.h / layout!.height) * 100}%`,
+    transform: `translate(-50%, -50%) rotate(${b.rotate}rad)`,
+  });
+
+  const renderSelection = (target: Target) => (
+    <div key={`sel-${target}`} className="pointer-events-none absolute border-2 border-dashed border-primary" style={boxStyle(boxOf(target))}>
+      {CORNERS.map((c) => (
+        <span
+          key={c.key}
+          onPointerDown={(e) => startGesture('scale', target, e)}
+          className={`pointer-events-auto absolute h-3 w-3 touch-none rounded-sm border-2 border-primary bg-white shadow ${c.className}`}
+          aria-hidden="true"
+        />
+      ))}
+      <span className="absolute -top-7 left-1/2 h-5 w-0 -translate-x-1/2 border-l-2 border-dashed border-primary" aria-hidden="true" />
+      <span
+        onPointerDown={(e) => startGesture('rotate', target, e)}
+        title="Drag to rotate"
+        className="pointer-events-auto absolute -top-9 left-1/2 h-4 w-4 -translate-x-1/2 cursor-grab touch-none rounded-full border-2 border-primary bg-white shadow active:cursor-grabbing"
+        aria-hidden="true"
+      />
+    </div>
+  );
+
   const toggle = (active: boolean) =>
     `inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition-colors ${
+      active ? 'bg-surface text-text shadow-soft' : 'text-muted hover:text-text'
+    }`;
+  const iconToggle = (active: boolean) =>
+    `inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:pointer-events-none disabled:opacity-40 ${
       active ? 'bg-surface text-text shadow-soft' : 'text-muted hover:text-text'
     }`;
 
   return (
     <section aria-label="Image preview" className="overflow-hidden rounded-2xl border border-border bg-surface">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2.5 sm:px-4">
-        <div className="flex gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" aria-label="Compare">
-          {(['result', 'original'] as const).map((v) => (
-            <button key={v} type="button" role="radio" aria-checked={view === v} onClick={() => props.onViewChange(v)} className={toggle(view === v)}>
-              {v === 'result' ? 'Result' : 'Original'}
+        <div className="flex gap-2">
+          <div className="flex gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" aria-label="Compare">
+            {(['result', 'original'] as const).map((v) => (
+              <button key={v} type="button" role="radio" aria-checked={view === v} onClick={() => props.onViewChange(v)} className={toggle(view === v)}>
+                {v === 'result' ? 'Result' : 'Original'}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1 rounded-lg bg-surface-2 p-1">
+            <button type="button" onClick={props.onUndo} disabled={!props.canUndo} aria-label="Undo" title="Undo (Ctrl/⌘+Z)" className={iconToggle(false)}>
+              <Undo2 size={15} />
+            </button>
+            <button type="button" onClick={props.onRedo} disabled={!props.canRedo} aria-label="Redo" title="Redo (Ctrl/⌘+Shift+Z)" className={iconToggle(false)}>
+              <Redo2 size={15} />
+            </button>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" aria-label="Tool">
+          {TOOLS.map((t) => (
+            <button
+              key={t.value}
+              type="button"
+              role="radio"
+              aria-checked={tool === t.value}
+              onClick={() => props.onToolChange(t.value)}
+              className={toggle(tool === t.value)}
+              title={t.title}
+            >
+              {t.icon} {t.label}
             </button>
           ))}
-        </div>
-        <div className="flex gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" aria-label="Click tool">
-          <button type="button" role="radio" aria-checked={tool === 'remove'} onClick={() => props.onToolChange('remove')} className={toggle(tool === 'remove')} title="Click an area to remove it">
-            <Eraser size={14} aria-hidden="true" /> Erase area
-          </button>
-          <button type="button" role="radio" aria-checked={tool === 'restore'} onClick={() => props.onToolChange('restore')} className={toggle(tool === 'restore')} title="Click an area to bring it back">
-            <Paintbrush size={14} aria-hidden="true" /> Restore area
-          </button>
+          {tool === 'fill' && (
+            <label
+              className="relative my-auto ml-1 h-6 w-6 shrink-0 cursor-pointer overflow-hidden rounded-full border border-border"
+              style={{ backgroundColor: props.fillColor }}
+              title="Fill color"
+            >
+              <input
+                type="color"
+                value={props.fillColor}
+                onChange={(e) => props.onFillColorChange(e.target.value)}
+                aria-label="Fill color"
+                className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+              />
+            </label>
+          )}
         </div>
         <div className="flex gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" aria-label="Preview background">
           {STAGES.map((s) => (
@@ -88,9 +522,7 @@ export function RemoverPreview(props: RemoverPreviewProps) {
               aria-label={s.label}
               title={s.label}
               onClick={() => props.onStageChange(s.value)}
-              className={`inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
-                stage === s.value ? 'bg-surface text-text shadow-soft' : 'text-muted hover:text-text'
-              }`}
+              className={iconToggle(stage === s.value)}
             >
               {s.icon}
             </button>
@@ -98,23 +530,178 @@ export function RemoverPreview(props: RemoverPreviewProps) {
         </div>
       </div>
 
-      <div className={`relative flex min-h-[360px] items-center justify-center p-4 sm:min-h-[480px] sm:p-8 ${stageClass}`}>
-        <canvas
-          ref={canvasRef}
-          onClick={onClick}
-          className={`max-h-[70vh] max-w-full cursor-crosshair object-contain ${view === 'original' ? 'hidden' : ''}`}
-          role="img"
-          aria-label={`Result preview. Click to ${tool === 'remove' ? 'erase' : 'restore'} a region.`}
-        />
+      {/* Stage area — background colour fills the full area so it's not just around the image edges */}
+      <div
+        className={`relative flex min-h-[360px] items-center justify-center overflow-hidden px-4 pb-4 pt-12 sm:min-h-[480px] sm:p-12 ${hasBackground ? '' : stageClass}`}
+        style={stageStyle}
+        onPointerDown={(e) => editing && e.target === e.currentTarget && onSelect(null)}
+      >
+        {editing && (
+          <div
+            className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-0.5 rounded-lg border border-border bg-surface p-1 shadow-soft"
+            role="toolbar"
+            aria-label="Selection"
+          >
+            <button
+              type="button"
+              aria-pressed={selected === 'all'}
+              onClick={() => onSelect(selected === 'all' ? null : 'all')}
+              title="Move, resize or rotate everything together"
+              className={`${toggle(selected === 'all')} h-7`}
+            >
+              <Square size={14} aria-hidden="true" /> Whole image
+            </button>
+            <button type="button" onClick={() => props.onAddText()} title="Add new text" className={`${toggle(false)} h-7`}>
+              <Type size={14} aria-hidden="true" /> Add text
+            </button>
+            {selectedText && (
+              <>
+                <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+                <input
+                  value={selectedText.text}
+                  onChange={(e) => onTextChange(selectedText.id, { text: e.target.value })}
+                  aria-label="Text"
+                  className="h-7 w-36 rounded-md border border-border bg-surface px-2 text-xs outline-none focus:border-primary"
+                />
+                <label
+                  className="relative mx-1 h-6 w-6 shrink-0 cursor-pointer overflow-hidden rounded-full border border-border"
+                  style={{ backgroundColor: selectedText.color }}
+                  title="Text color"
+                >
+                  <input
+                    type="color"
+                    value={selectedText.color}
+                    onChange={(e) => onTextChange(selectedText.id, { color: e.target.value })}
+                    aria-label="Text color"
+                    className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                  />
+                </label>
+              </>
+            )}
+            {selected !== null && selected !== 'all' && (
+              <>
+                <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+                {ALIGNS.map((a) => (
+                  <button
+                    key={a.value}
+                    type="button"
+                    onClick={() => apply(selected, typeof selected === 'number' ? alignLayer(layout, selected, a.value) : alignText(selected, a.value))}
+                    aria-label={a.label}
+                    title={a.label}
+                    className={iconToggle(false)}
+                  >
+                    {a.icon}
+                  </button>
+                ))}
+                <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+                {selectedText && (
+                  <button
+                    type="button"
+                    onClick={() => props.onDeleteText(selectedText.id)}
+                    aria-label="Delete text"
+                    title="Delete text (Del)"
+                    className={`${iconToggle(false)} hover:text-danger`}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </>
+            )}
+            {typeof selected === 'number' && (
+              <>
+                {layout.layers?.layers[selected]?.splitAnchor == null && (
+                  <button
+                    type="button"
+                    onClick={() => props.onSplit(selected)}
+                    title="Split into letters and color parts — move each one separately"
+                    className={`${toggle(false)} h-7`}
+                  >
+                    <Ungroup size={15} aria-hidden="true" /> Split letters
+                  </button>
+                )}
+                {layout.layers?.layers[selected]?.splitAnchor != null && (
+                  <button
+                    type="button"
+                    onClick={() => props.onJoin(selected)}
+                    title="Join these letters back into one element"
+                    className={`${toggle(false)} h-7`}
+                  >
+                    <Group size={15} aria-hidden="true" /> Join letters
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => replaceWithText(selected)}
+                  title="Delete this and type new text in its place"
+                  className={`${toggle(false)} h-7`}
+                >
+                  <Type size={15} aria-hidden="true" /> Replace with text
+                </button>
+                <button
+                  type="button"
+                  onClick={() => apply(selected, IDENTITY_TRANSFORM)}
+                  aria-label="Put element back"
+                  title="Put element back"
+                  className={iconToggle(false)}
+                >
+                  <RotateCcw size={15} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => props.onDeleteLayer(selected)}
+                  aria-label="Delete element"
+                  title="Delete element (Del)"
+                  className={`${iconToggle(false)} hover:text-danger`}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </>
+            )}
+          </div>
+        )}
+        <div
+          className={`relative max-w-full outline-none ${view === 'original' ? 'hidden' : ''}`}
+          onPointerDown={onCanvasPointerDown}
+          onDoubleClick={onDoubleClick}
+          onKeyDown={onKeyNudge}
+          tabIndex={editing ? 0 : -1}
+          aria-label={editing ? 'Image editor. Click a text or shape to select it; arrow keys move the selection.' : undefined}
+        >
+          <canvas
+            ref={canvasRef}
+            onClick={onClick}
+            className={`block max-h-[70vh] max-w-full touch-none object-contain ${editing ? 'cursor-move outline-1 outline-dashed outline-border-strong' : 'cursor-crosshair'}`}
+            role="img"
+            aria-label={tool === 'edit' ? 'Result preview.' : `Result preview. Click to ${tool === 'remove' ? 'erase' : tool} a region.`}
+          />
+          {editing && selected !== 'all' &&
+            selectable.map(
+              (i) =>
+                i !== selected && (
+                  <div
+                    key={i}
+                    className="pointer-events-none absolute border border-dashed border-primary/60"
+                    style={boxStyle(boxOf(i))}
+                    aria-hidden="true"
+                  />
+                ),
+            )}
+          {editing &&
+            selected !== 'all' &&
+            layout.texts.map(
+              (t) =>
+                `text:${t.id}` !== selected && (
+                  <div key={t.id} className="pointer-events-none absolute border border-dashed border-primary/60" style={boxStyle(t)} aria-hidden="true" />
+                ),
+            )}
+          {editing && selected !== null && renderSelection(selected)}
+        </div>
         {view === 'original' && <img src={originalUrl} alt="Original upload" className="max-h-[70vh] max-w-full object-contain" />}
         {processing && (
           <span className="absolute right-3 top-3 rounded-md bg-black/60 px-2 py-0.5 text-[11px] font-medium text-white">Processing…</span>
         )}
       </div>
-      <p className="border-t border-border px-4 py-2.5 text-xs text-muted">
-        Tip: click any leftover background to <strong className="text-text">erase</strong> it, or switch to <strong className="text-text">Restore</strong> and click
-        a part that was removed by mistake.
-      </p>
+      <p className="border-t border-border px-4 py-2.5 text-xs text-muted">Tip: {TIPS[tool]}</p>
     </section>
   );
 }

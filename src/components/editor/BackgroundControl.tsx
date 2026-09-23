@@ -41,6 +41,8 @@ export function BackgroundControl({ background, transparent, padding, radius, on
           value={background}
           swatches={BG_SWATCHES}
           onChange={(hex) => onChange({ background: hex, transparent: false })}
+          onTransparent={() => onChange({ transparent: true })}
+          transparentActive={transparent}
         />
       </div>
       <RangeField label="Padding" value={padding} min={0} max={40} unit="%" onChange={(v) => onChange({ padding: v })} />
