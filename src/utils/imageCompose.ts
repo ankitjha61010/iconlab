@@ -4,6 +4,7 @@
  * transform (move / resize / rotate / flip) of the subject.
  */
 
+import type { FontGuess } from './fontMatch';
 import { layerPiece, layerRest, type LayerSet } from './imageLayers';
 
 export interface ImageTransform {
@@ -36,6 +37,8 @@ export interface TextItem {
   font: string;
   bold: boolean;
   italic: boolean;
+  /** Fonts closest to the image lettering this text replaced or was added to, best first (if any). */
+  matches?: FontGuess[];
 }
 
 export const IDENTITY_TRANSFORM: ImageTransform = { rotate: 0, zoom: 1, x: 0, y: 0, flipX: false, flipY: false };
@@ -172,16 +175,56 @@ export function hitTest(layout: ComposeLayout, x: number, y: number): { x: numbe
     const p = throughLayer(layout, edited[j], lx, ly);
     if (labelAt(p.x, p.y) === edited[j]) return { ...p, layer: edited[j] };
   }
-  const k = unit(layout);
-  const p = { x: layout.box.x + layout.box.w / 2 + lx / k, y: layout.box.y + layout.box.h / 2 + ly / k };
+  const p = toBasePoint(layout, x, y);
   const layer = labelAt(p.x, p.y);
   return { ...p, layer: edited.includes(layer) ? -1 : layer };
 }
 
-/** Maps a point on the output canvas back to source-image pixels (for click tools). */
+/** Maps source-image px to the output canvas (the artwork itself, ignoring moved elements). */
+export function fromSourcePoint(layout: ComposeLayout, sx: number, sy: number) {
+  const k = unit(layout);
+  return fromLocal(layout, (sx - (layout.box.x + layout.box.w / 2)) * k, (sy - (layout.box.y + layout.box.h / 2)) * k);
+}
+
+/** Maps a point on the output canvas to source-image pixels of the artwork itself, ignoring moved elements (for the heal brush). */
+export function toBasePoint(layout: ComposeLayout, x: number, y: number) {
+  const { lx, ly } = toLocal(layout, x, y);
+  const k = unit(layout);
+  return { x: layout.box.x + layout.box.w / 2 + lx / k, y: layout.box.y + layout.box.h / 2 + ly / k };
+}
+
+/**
+ * Maps a point on the output canvas back to source-image pixels (for click tools).
+ * A click on the spot a moved or deleted element left behind means the healed
+ * artwork seen there, so it lands on the nearest pixel outside edited elements.
+ */
 export function toSourcePoint(layout: ComposeLayout, x: number, y: number) {
-  const { x: sx, y: sy } = hitTest(layout, x, y);
-  return { x: sx, y: sy };
+  const hit = hitTest(layout, x, y);
+  const set = layout.layers;
+  if (!set || hit.layer >= 0) return { x: hit.x, y: hit.y };
+  const px = Math.floor(hit.x);
+  const py = Math.floor(hit.y);
+  if (px < 0 || py < 0 || px >= set.width || py >= set.height) return { x: hit.x, y: hit.y };
+  const edited = new Set(editedLayers(layout));
+  if (!edited.has(set.labels[py * set.width + px])) return { x: hit.x, y: hit.y };
+  const free = (sx: number, sy: number) => {
+    if (sx < 0 || sy < 0 || sx >= set.width || sy >= set.height) return false;
+    const label = set.labels[sy * set.width + sx];
+    return label >= 0 && !edited.has(label);
+  };
+  // Square rings outward; the first free pixel on the nearest ring wins.
+  for (let r = 1, max = Math.max(set.width, set.height); r < max; r++) {
+    for (let d = -r; d <= r; d++) {
+      for (const [sx, sy] of [
+        [px + d, py - r],
+        [px + d, py + r],
+        [px - r, py + d],
+        [px + r, py + d],
+      ])
+        if (free(sx, sy)) return { x: sx + 0.5, y: sy + 0.5 };
+    }
+  }
+  return { x: hit.x, y: hit.y };
 }
 
 /** Element `i`'s box on the output canvas: center, unrotated size and on-screen rotation (radians). */

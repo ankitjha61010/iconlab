@@ -6,12 +6,14 @@
  * 1. an automatic pass that flood-fills from the image border using the
  *    detected background color, then
  * 2. manual "remove"/"restore" clicks (magic-wand style), in order.
- *    ("fill" clicks recolor the cut-out afterwards; see applyFills.)
+ *    ("fill" clicks and heal-brush strokes change the cut-out afterwards; see applyFills.)
  *
  * Edge pixels next to removed areas get partial alpha based on how close they
  * are to the removed color, and that color is un-mixed from them so no halo
  * of the old background is left behind.
  */
+
+import { HEAL_REACH, healPixels } from './heal';
 
 export interface WorkingImage {
   width: number;
@@ -30,7 +32,15 @@ export type RemovalOp =
   | { kind: 'remove'; x: number; y: number; tolerance: number; contiguous: boolean }
   | { kind: 'restore'; x: number; y: number; tolerance: number }
   /** Paints a visible region a new color (applied to the cut-out, not the mask). */
-  | { kind: 'fill'; x: number; y: number; tolerance: number; color: RGB };
+  | { kind: 'fill'; x: number; y: number; tolerance: number; color: RGB }
+  /** Heal brush: paints over a stroke (x, y pairs, source px) with the background around it. */
+  | { kind: 'heal'; points: number[]; radius: number }
+  /**
+   * Recolors exactly one part of the image. Its pixels are kept (runs of
+   * [row, start, length] within the box at x, y), so later edits that change
+   * how the image splits into parts don't move the fill.
+   */
+  | { kind: 'paint'; x: number; y: number; w: number; h: number; runs: number[]; color: RGB };
 
 export interface RemovalSettings {
   auto: boolean;
@@ -333,6 +343,7 @@ export function buildMask(img: WorkingImage, settings: RemovalSettings, ops: Rem
   }
 
   for (const op of ops.slice(-MAX_OPS)) {
+    if (op.kind !== 'remove' && op.kind !== 'restore') continue;
     const x = Math.round(op.x);
     const y = Math.round(op.y);
     if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
@@ -408,21 +419,31 @@ export function renderCutout(img: WorkingImage, mask: Mask, settings: RemovalSet
 }
 
 /**
- * Replays "fill" ops on the cut-out: flood-fills the clicked region (by the
- * original colors, staying inside visible pixels) with the chosen color.
+ * Replays "fill" and "heal" ops on the cut-out, in order. A fill flood-fills
+ * the clicked region (by the colors as they are now, so a healed spot fills
+ * with what's around it; staying inside visible pixels) with the chosen color.
  * Anti-aliased pixels on the region's border are blended so edges stay smooth.
+ * A heal stroke is painted over with the background around it.
  */
 export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[]) {
   const { width, height } = img;
   const px = cutout.data;
   for (const op of ops.slice(-MAX_OPS)) {
+    if (op.kind === 'heal') {
+      healStroke(cutout, op.points, op.radius);
+      continue;
+    }
+    if (op.kind === 'paint') {
+      paintPart(cutout, op);
+      continue;
+    }
     if (op.kind !== 'fill') continue;
     const x = Math.round(op.x);
     const y = Math.round(op.y);
     if (x < 0 || y < 0 || x >= width || y >= height) continue;
     const seed = y * width + x;
     if (px[seed * 4 + 3] < TRANSPARENT) continue;
-    const target = pixelColor(img, x, y);
+    const target = { r: px[seed * 4], g: px[seed * 4 + 1], b: px[seed * 4 + 2] };
     const dist = toDistance(op.tolerance);
     const limit = dist * dist;
     const filled = new Uint8Array(width * height);
@@ -438,7 +459,7 @@ export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[
       px[i + 2] = op.color.b;
       const cx = p % width;
       const push = (q: number) => {
-        if (filled[q] || px[q * 4 + 3] < TRANSPARENT || distSq(img.data, q * 4, target) > limit) return;
+        if (filled[q] || px[q * 4 + 3] < TRANSPARENT || distSq(px, q * 4, target) > limit) return;
         filled[q] = 1;
         stack[top++] = q;
       };
@@ -455,12 +476,105 @@ export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[
         (cx > 0 && filled[p - 1]) || (cx < width - 1 && filled[p + 1]) || (p >= width && filled[p - width]) || (p < width * (height - 1) && filled[p + width]);
       if (!touches) continue;
       const i = p * 4;
-      const t = Math.max(0, 1 - Math.sqrt(distSq(img.data, i, target)) / (dist * 3));
+      const t = Math.max(0, 1 - Math.sqrt(distSq(px, i, target)) / (dist * 3));
       px[i] += (op.color.r - px[i]) * t;
       px[i + 1] += (op.color.g - px[i + 1]) * t;
       px[i + 2] += (op.color.b - px[i + 2]) * t;
     }
   }
+}
+
+/**
+ * Recolors a part. Its anti-aliased rim is a mix of the part's color and
+ * what's next to it, so each pixel gets the color change in proportion to how
+ * close it is to the part's own color: the edge stays smooth.
+ */
+function paintPart(cutout: ImageData, op: Extract<RemovalOp, { kind: 'paint' }>) {
+  const { width, height, data } = cutout;
+  const pixels: number[] = [];
+  for (let k = 0; k + 2 < op.runs.length; k += 3) {
+    const y = op.y + op.runs[k];
+    if (y < 0 || y >= height) continue;
+    for (let x = op.x + op.runs[k + 1], end = x + op.runs[k + 2]; x < end; x++) if (x >= 0 && x < width) pixels.push(y * width + x);
+  }
+  const solid = pixels.filter((p) => data[p * 4 + 3] >= 200);
+  if (!solid.length) return;
+  // The part's own color: the median of its pixels (its rim is the minority).
+  const own = [0, 1, 2].map((k) => {
+    const v = solid.map((p) => data[p * 4 + k]).sort((a, b) => a - b);
+    return v[v.length >> 1];
+  });
+  const dist = (p: number) => Math.hypot(data[p * 4] - own[0], data[p * 4 + 1] - own[1], data[p * 4 + 2] - own[2]);
+  // How far the rim strays from the part's color (the furthest few percent).
+  const far = solid.map(dist).sort((a, b) => a - b)[Math.floor(solid.length * 0.97)] ?? 0;
+  const reach = Math.max(60, far * 1.25);
+  const shift = [op.color.r - own[0], op.color.g - own[1], op.color.b - own[2]];
+  for (const p of pixels) {
+    const t = Math.max(0, 1 - dist(p) / reach);
+    for (let k = 0; k < 3; k++) data[p * 4 + k] += shift[k] * t;
+  }
+}
+
+/** Paints over a brush stroke with the background around it. Transparent parts of the stroke stay transparent. */
+function healStroke(cutout: ImageData, points: number[], radius: number) {
+  const { width, height, data } = cutout;
+  if (points.length < 2 || radius <= 0) return;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let k = 0; k < points.length; k += 2) {
+    minX = Math.min(minX, points[k]);
+    maxX = Math.max(maxX, points[k]);
+    minY = Math.min(minY, points[k + 1]);
+    maxY = Math.max(maxY, points[k + 1]);
+  }
+  const pad = radius + HEAL_REACH + 1;
+  const x0 = Math.max(0, Math.floor(minX - pad));
+  const y0 = Math.max(0, Math.floor(minY - pad));
+  const x1 = Math.min(width, Math.ceil(maxX + pad));
+  const y1 = Math.min(height, Math.ceil(maxY + pad));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w <= 0 || h <= 0) return;
+
+  // The stroke: every pixel within `radius` of one of its segments.
+  const inStroke = new Uint8Array(w * h);
+  const r2 = radius * radius;
+  for (let k = 0; k < points.length; k += 2) {
+    const ax = points[k];
+    const ay = points[k + 1];
+    const bx = k + 3 < points.length ? points[k + 2] : ax;
+    const by = k + 3 < points.length ? points[k + 3] : ay;
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const sx0 = Math.max(x0, Math.floor(Math.min(ax, bx) - radius));
+    const sx1 = Math.min(x1 - 1, Math.ceil(Math.max(ax, bx) + radius));
+    const sy0 = Math.max(y0, Math.floor(Math.min(ay, by) - radius));
+    const sy1 = Math.min(y1 - 1, Math.ceil(Math.max(ay, by) + radius));
+    for (let y = sy0; y <= sy1; y++) {
+      for (let x = sx0; x <= sx1; x++) {
+        const cx = x + 0.5;
+        const cy = y + 0.5;
+        const t = len2 ? Math.max(0, Math.min(1, ((cx - ax) * dx + (cy - ay) * dy) / len2)) : 0;
+        const ex = cx - (ax + t * dx);
+        const ey = cy - (ay + t * dy);
+        if (ex * ex + ey * ey <= r2) inStroke[(y - y0) * w + (x - x0)] = 1;
+      }
+    }
+  }
+
+  const box = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) box.set(data.subarray(((y0 + y) * width + x0) * 4, ((y0 + y) * width + x1) * 4), y * w * 4);
+  const state = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    const a = box[p * 4 + 3];
+    if (inStroke[p]) state[p] = a >= TRANSPARENT ? 2 : 0;
+    else if (a >= 200) state[p] = 1;
+  }
+  healPixels(box, w, h, state);
+  for (let y = 0; y < h; y++) data.set(box.subarray(y * w * 4, (y + 1) * w * 4), ((y0 + y) * width + x0) * 4);
 }
 
 export function countRemoved(cutout: ImageData) {

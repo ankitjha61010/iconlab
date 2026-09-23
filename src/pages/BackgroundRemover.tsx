@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ImageDropzone } from '../components/bgremover/ImageDropzone';
-import { RemoverPreview, type PickTool, type PreviewStage, type PreviewView, type Selection } from '../components/bgremover/RemoverPreview';
+import { RemoverPreview, type FillMode, type PickTool, type PreviewStage, type PreviewView, type Selection } from '../components/bgremover/RemoverPreview';
 import { RemoverControls, TEXT_FONTS, type RasterFormat, type StyleState } from '../components/bgremover/RemoverControls';
 import { useToast } from '../components/common/Toast';
 import { useDebounce } from '../hooks/useDebounce';
@@ -22,9 +22,11 @@ import {
 } from '../utils/backgroundRemoval';
 import { IDENTITY_TRANSFORM, canvasToBlob, composeImage, contentBounds, hexToRgb, type ComposeOptions, type ImageTransform, type TextItem } from '../utils/imageCompose';
 import { buildCustomSvg } from '../utils/svgUtils';
-import { inheritTransforms, segmentLayers } from '../utils/imageLayers';
+import { anchorIndex, inheritTransforms, segmentLayers, type LayerSet } from '../utils/imageLayers';
 import { svgToRaster } from '../utils/imageExport';
 import { downloadBlob } from '../utils/downloadUtils';
+import { mainTextPieces, rankFonts, type FontGuess } from '../utils/fontMatch';
+import { loadTextFonts } from '../utils/textFonts';
 import { DEFAULT_CUSTOMIZATION } from '../components/editor/IconEditor';
 
 const DEFAULT_SETTINGS: RemovalSettings = {
@@ -60,6 +62,8 @@ const DEFAULT_STYLE: StyleState = {
   texts: [],
 };
 const SAMPLE_ICON = 'fluent-emoji-flat:rocket';
+/** How many close font matches are offered for added text. */
+const MATCHES = 5;
 const MIME: Record<RasterFormat, string> = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' };
 
 /** Everything undo / redo steps through. */
@@ -69,6 +73,25 @@ interface EditorState {
   style: StyleState;
 }
 const INITIAL_STATE: EditorState = { settings: DEFAULT_SETTINGS, ops: [], style: DEFAULT_STYLE };
+
+/** Part `i`'s pixels as runs of [row, start, length] within its box. */
+function partRuns(set: LayerSet, i: number) {
+  const L = set.layers[i];
+  const runs: number[] = [];
+  for (let y = 0; y < L.h; y++) {
+    const row = (L.y + y) * set.width + L.x;
+    let start = -1;
+    for (let x = 0; x <= L.w; x++) {
+      const inside = x < L.w && set.labels[row + x] === i;
+      if (inside && start < 0) start = x;
+      else if (!inside && start >= 0) {
+        runs.push(y, start, x - start);
+        start = -1;
+      }
+    }
+  }
+  return { x: L.x, y: L.y, w: L.w, h: L.h, runs };
+}
 
 const textId = (sel: Selection) => (typeof sel === 'string' && sel.startsWith('text:') ? sel.slice(5) : null);
 const newTextId = () => Math.random().toString(36).slice(2, 10);
@@ -97,6 +120,8 @@ export default function BackgroundRemover() {
     'Remove image backgrounds in your browser, then add a background color, recolor logos and download PNG, JPG or WebP. Nothing is uploaded.',
   );
   const notify = useToast();
+  // Text fonts load in the background, so they're ready when text is added.
+  useEffect(() => void loadTextFonts(), []);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -126,6 +151,8 @@ export default function BackgroundRemover() {
   /** Edit-tool selection: an element index, the whole image, or nothing. */
   const [selected, setSelected] = useState<Selection>(null);
   const [fillColor, setFillColor] = useState('#5b4cf0');
+  /** Fill one part of the image (as split into parts), or everything of a similar color that touches the click. */
+  const [fillMode, setFillMode] = useState<FillMode>('part');
   const [view, setView] = useState<PreviewView>('result');
   const [stage, setStage] = useState<PreviewStage>('checker');
   const [busy, setBusy] = useState<RasterFormat | 'copy' | null>(null);
@@ -215,11 +242,19 @@ export default function BackgroundRemover() {
     () => (cutout && needLayers ? segmentLayers(cutout, style.elementGap, style.splits) : null),
     [cutout, needLayers, style.elementGap, style.splits],
   );
+  // For filling one part: the whole image split into its parts (like Split on everything).
+  const fillParts = useMemo(
+    () => (cutout && tool === 'fill' && fillMode === 'part' ? segmentLayers(cutout, style.elementGap, 'all') : null),
+    [cutout, tool, fillMode, style.elementGap],
+  );
   // Each element's own edit; elements sitting inside another (a letter's inner fill) follow it unless edited themselves.
   const layerTransforms = useMemo(() => {
     const own: Array<ImageTransform | undefined> = [];
     if (!layers) return own;
-    for (const e of style.elements) if (layers.labels[e.anchor] >= 0) own[layers.labels[e.anchor]] = e.transform;
+    for (const e of style.elements) {
+      const i = anchorIndex(layers, e.anchor);
+      if (i >= 0) own[i] = e.transform;
+    }
     return inheritTransforms(layers, own);
   }, [layers, style.elements]);
   const selectedLayer =
@@ -231,7 +266,7 @@ export default function BackgroundRemover() {
     (i: number, patch: Partial<ImageTransform>, group: string | null = `layer:${i}:${Object.keys(patch).join()}`) => {
       if (!layers?.layers[i]) return;
       setState((st) => {
-        const at = st.style.elements.findIndex((e) => layers.labels[e.anchor] === i);
+        const at = st.style.elements.findIndex((e) => anchorIndex(layers, e.anchor) === i);
         const elements = [...st.style.elements];
         if (at >= 0) elements[at] = { ...elements[at], transform: { ...elements[at].transform, ...patch } };
         // First own edit starts from where it is now (it may be following its parent).
@@ -242,9 +277,25 @@ export default function BackgroundRemover() {
     [layers, layerTransforms, setState],
   );
 
-  /** Adds a text (by default in the middle of the canvas) and selects it. `hide` deletes an element in the same undo step. */
+  /**
+   * Adds a text (by default in the middle of the canvas) and selects it. `hide` deletes the elements it
+   * replaces in the same undo step. The font is matched to that lettering, else to the image's main line of text.
+   */
   const addText = useCallback(
-    (props: Partial<TextItem> = {}, hide?: number) => {
+    async (props: Partial<TextItem> = {}, hide: number[] = []) => {
+      const replaced = layers ? hide.filter((i) => layers.layers[i]) : [];
+      let matches: FontGuess[] = [];
+      if (cutout && layers) {
+        const pieces = replaced.length ? replaced : mainTextPieces(cutout, layers);
+        if (pieces) {
+          // The first match draws every font's letters (about a second); say so if it's slow.
+          const slow = setTimeout(() => notify('Matching the font to your image…'), 400);
+          matches = (await rankFonts(cutout, layers, pieces).catch(() => [])).slice(0, MATCHES).map(({ score: _, ...g }) => g);
+          clearTimeout(slow);
+        }
+      }
+      const [best] = matches;
+      const look = best ? { font: best.font, bold: best.bold, italic: best.italic, matches } : { font: TEXT_FONTS[0].value, bold: true, italic: false };
       const item: TextItem = {
         id: newTextId(),
         text: 'Your text',
@@ -253,27 +304,25 @@ export default function BackgroundRemover() {
         size: 0.12,
         rotate: 0,
         color: '#111827',
-        font: TEXT_FONTS[0].value,
-        bold: true,
-        italic: false,
+        ...look,
         ...props,
       };
-      const hideAnchor = hide !== undefined && layers?.layers[hide] ? hide : null;
       setState((st) => {
         let elements = st.style.elements;
-        if (hideAnchor !== null && layers) {
-          const at = elements.findIndex((e) => layers.labels[e.anchor] === hideAnchor);
+        for (const i of replaced) {
+          if (!layers) break;
+          const at = elements.findIndex((e) => anchorIndex(layers, e.anchor) === i);
           elements =
             at >= 0
               ? elements.map((e, j) => (j === at ? { ...e, transform: { ...e.transform, hidden: true } } : e))
-              : [...elements, { anchor: layers.layers[hideAnchor].anchor, transform: { ...IDENTITY_TRANSFORM, hidden: true } }];
+              : [...elements, { anchor: layers.layers[i].anchor, transform: { ...IDENTITY_TRANSFORM, hidden: true } }];
         }
         return { ...st, style: { ...st.style, elements, texts: [...st.style.texts, item] } };
       });
       setTool('edit');
       setSelected(`text:${item.id}`);
     },
-    [layers, setState],
+    [cutout, layers, setState, notify],
   );
   const updateText = useCallback(
     (id: string, patch: Partial<TextItem>, group = `text:${id}:${Object.keys(patch).join()}`) =>
@@ -305,7 +354,7 @@ export default function BackgroundRemover() {
         style: {
           ...st.style,
           splits: [...st.style.splits, L.anchor],
-          elements: st.style.elements.filter((e) => layers.labels[e.anchor] !== i),
+          elements: st.style.elements.filter((e) => anchorIndex(layers, e.anchor) !== i),
         },
       }));
       setSelected(null);
@@ -324,7 +373,7 @@ export default function BackgroundRemover() {
         style: {
           ...st.style,
           splits: st.style.splits.filter((a) => a !== split),
-          elements: st.style.elements.filter((e) => !letters.has(layers.labels[e.anchor])),
+          elements: st.style.elements.filter((e) => !letters.has(anchorIndex(layers, e.anchor))),
         },
       }));
       setSelected(null);
@@ -374,7 +423,11 @@ export default function BackgroundRemover() {
     else if (tool === 'restore') pushOp({ kind: 'restore', x, y, tolerance: settings.tolerance });
     else {
       const color = hexToRgb(fillColor);
-      if (color) pushOp({ kind: 'fill', x, y, tolerance: settings.tolerance, color });
+      if (!color) return;
+      if (fillMode === 'color' || !fillParts) return pushOp({ kind: 'fill', x, y, tolerance: settings.tolerance, color });
+      const part = fillParts.labels[Math.floor(y) * fillParts.width + Math.floor(x)];
+      if (part === undefined || part < 0) return;
+      pushOp({ kind: 'paint', ...partRuns(fillParts, part), color });
     }
   };
 
@@ -456,7 +509,11 @@ export default function BackgroundRemover() {
             onToolChange={setTool}
             fillColor={fillColor}
             onFillColorChange={setFillColor}
+            fillMode={fillMode}
+            onFillModeChange={setFillMode}
+            fillParts={fillParts}
             onPick={onPick}
+            onHeal={(points, radius) => pushOp({ kind: 'heal', points, radius })}
             onTransform={setTransform}
             selected={selection}
             onSelect={setSelected}

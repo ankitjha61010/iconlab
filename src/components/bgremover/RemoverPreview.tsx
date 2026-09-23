@@ -6,6 +6,7 @@ import {
   AlignEndVertical,
   AlignStartHorizontal,
   AlignStartVertical,
+  Bandage,
   Eraser,
   Grid3x3,
   Group,
@@ -29,6 +30,8 @@ import {
   hitTest,
   layerBox,
   screenToLayerDelta,
+  fromSourcePoint,
+  toBasePoint,
   toSourcePoint,
   type Align,
   type Bounds,
@@ -37,12 +40,15 @@ import {
   type ImageTransform,
   type TextItem,
 } from '../../utils/imageCompose';
+import { inkColor, linePieces } from '../../utils/fontMatch';
 import type { LayerSet } from '../../utils/imageLayers';
 
 export type PreviewStage = 'checker' | 'grid' | 'light' | 'dark';
-/** 'edit' moves / resizes / rotates the subject; the others are click-a-region tools. */
-export type PickTool = 'edit' | 'remove' | 'restore' | 'fill';
+/** 'edit' moves / resizes / rotates the subject; 'heal' is a brush; the others are click-a-region tools. */
+export type PickTool = 'edit' | 'remove' | 'restore' | 'fill' | 'heal';
 export type PreviewView = 'result' | 'original';
+/** Fill tool: one part of the image, or the similar color around the click. */
+export type FillMode = 'part' | 'color';
 
 const STAGES = [
   { value: 'checker', label: 'Transparency grid', icon: <Square size={15} />, className: 'stage-checker' },
@@ -68,7 +74,13 @@ interface RemoverPreviewProps {
   onToolChange: (tool: PickTool) => void;
   fillColor: string;
   onFillColorChange: (color: string) => void;
+  fillMode: FillMode;
+  onFillModeChange: (mode: FillMode) => void;
+  /** The image split into parts, while filling by part (for the highlight under the pointer). */
+  fillParts: LayerSet | null;
   onPick: (x: number, y: number) => void;
+  /** A finished heal-brush stroke: x, y pairs and the brush radius, in source px. */
+  onHeal: (points: number[], radius: number) => void;
   /** `group` merges a whole drag gesture into one undo step. */
   onTransform: (patch: Partial<ImageTransform>, group?: string) => void;
   /** Edit-tool selection: an element (text line, shape) index, the whole image, an added text, or nothing. */
@@ -78,7 +90,8 @@ interface RemoverPreviewProps {
   onDeleteLayer: (i: number) => void;
   onTextChange: (id: string, patch: Partial<TextItem>, group?: string) => void;
   /** Adds a text; with `hide`, element `hide` is deleted in the same step (replace). */
-  onAddText: (props?: Partial<TextItem>, hide?: number) => void;
+  /** `hide`: elements the text replaces, deleted in the same undo step. */
+  onAddText: (props?: Partial<TextItem>, hide?: number[]) => void;
   onDeleteText: (id: string) => void;
   /** Break an element into its separate letters / shapes, or join split letters back. */
   onSplit: (i: number) => void;
@@ -95,13 +108,15 @@ const TOOLS = [
   { value: 'remove', label: 'Erase area', title: 'Click an area to remove it', icon: <Eraser size={14} aria-hidden="true" /> },
   { value: 'restore', label: 'Restore area', title: 'Click an area to bring it back', icon: <Paintbrush size={14} aria-hidden="true" /> },
   { value: 'fill', label: 'Fill area', title: 'Click an area to fill it with a color', icon: <PaintBucket size={14} aria-hidden="true" /> },
+  { value: 'heal', label: 'Heal brush', title: 'Paint over anything to replace it with the background around it', icon: <Bandage size={14} aria-hidden="true" /> },
 ] as const;
 
 const TIPS: Record<PickTool, string> = {
   edit: 'Click a text or shape to select it, then drag to move, drag a corner to resize or the round handle to rotate (Shift snaps to 15°). Double-click a word to move its letters one by one. Del deletes the selection; “Replace with text” swaps it for your own text. Use “Whole image” to move everything; Esc deselects.',
   remove: 'Click any leftover background to erase it.',
   restore: 'Click a part that was removed by mistake to bring it back.',
-  fill: 'Click one part of the image to paint it with the chosen color.',
+  fill: 'One part: the part under the pointer is highlighted; click to fill just it. Similar color: fills everything of a similar color touching the click.',
+  heal: 'Paint over anything you want gone (a label, an icon, a shadow). It’s replaced by the background around it: plain colors stay plain, gradients carry on.',
 };
 
 const CORNERS = [
@@ -119,30 +134,6 @@ export type Selection = number | 'all' | `text:${string}` | null;
 type Target = Exclude<Selection, null>;
 const textIdOf = (t: Selection) => (typeof t === 'string' && t.startsWith('text:') ? t.slice(5) : null);
 
-/** Most common color of element `i` (for text that replaces it). */
-function layerColor(cutout: ImageData, set: LayerSet, i: number) {
-  const counts = new Map<number, { n: number; r: number; g: number; b: number }>();
-  const L = set.layers[i];
-  const d = cutout.data;
-  for (let y = L.y; y < L.y + L.h; y++) {
-    for (let x = L.x; x < L.x + L.w; x++) {
-      const p = y * set.width + x;
-      if (set.labels[p] !== i || d[p * 4 + 3] < 200) continue;
-      const [r, g, b] = [d[p * 4], d[p * 4 + 1], d[p * 4 + 2]];
-      const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
-      const c = counts.get(key) ?? { n: 0, r: 0, g: 0, b: 0 };
-      c.n++;
-      c.r += r;
-      c.g += g;
-      c.b += b;
-      counts.set(key, c);
-    }
-  }
-  let best: { n: number; r: number; g: number; b: number } | null = null;
-  for (const c of counts.values()) if (!best || c.n > best.n) best = c;
-  if (!best) return '#111827';
-  return `#${[best.r, best.g, best.b].map((v) => Math.round(v / best!.n).toString(16).padStart(2, '0')).join('')}`;
-}
 interface Box {
   x: number;
   y: number;
@@ -175,6 +166,17 @@ export function RemoverPreview(props: RemoverPreviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [layout, setLayout] = useState<ComposeLayout | null>(null);
   const transform = options.transform ?? IDENTITY_TRANSFORM;
+  /** Heal brush diameter in screen px, the stroke being painted and the pointer (both relative to the canvas, screen px). */
+  const [brushSize, setBrushSize] = useState(24);
+  const [stroke, setStroke] = useState<number[] | null>(null);
+  const [brushAt, setBrushAt] = useState<{ x: number; y: number } | null>(null);
+  // Redraw once web fonts finish loading, so added text doesn't stay in a fallback font.
+  const [fontsLoaded, setFontsLoaded] = useState(0);
+  useEffect(() => {
+    const onLoaded = () => setFontsLoaded((n) => n + 1);
+    document.fonts.addEventListener('loadingdone', onLoaded);
+    return () => document.fonts.removeEventListener('loadingdone', onLoaded);
+  }, []);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -196,7 +198,7 @@ export function RemoverPreview(props: RemoverPreviewProps) {
       canvasRef.current,
     );
     setLayout(layout);
-  }, [cutout, bounds, options]);
+  }, [cutout, bounds, options, fontsLoaded]);
 
   const editing = tool === 'edit' && view === 'result' && layout !== null;
 
@@ -226,11 +228,99 @@ export function RemoverPreview(props: RemoverPreviewProps) {
   };
 
   const onClick = (e: MouseEvent<HTMLCanvasElement>) => {
-    if (tool === 'edit' || !layout) return;
+    if (tool === 'edit' || tool === 'heal' || !layout) return;
     const p = canvasPoint(e.clientX, e.clientY);
     const { x, y } = toSourcePoint(layout, p.x, p.y);
     if (x >= 0 && y >= 0 && x < cutout.width && y < cutout.height) onPick(x, y);
   };
+
+  /** Heal brush: paint a stroke while the button is down, then hand it over in source px. */
+  const onBrushDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (tool !== 'heal' || !layout || e.button !== 0) return;
+    e.preventDefault();
+    const canvas = e.currentTarget;
+    canvas.setPointerCapture(e.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    const points = [e.clientX - rect.left, e.clientY - rect.top];
+    setStroke([...points]);
+    const onMove = (ev: PointerEvent) => {
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      // Skip points closer than a few px; the stroke is drawn with round joins anyway.
+      if (Math.hypot(x - points[points.length - 2], y - points[points.length - 1]) < Math.max(2, brushSize / 6)) return;
+      points.push(x, y);
+      setStroke([...points]);
+    };
+    const onUp = () => {
+      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onUp);
+      canvas.removeEventListener('pointercancel', onUp);
+      setStroke(null);
+      const toOutput = layout.width / rect.width;
+      const source: number[] = [];
+      for (let k = 0; k < points.length; k += 2) {
+        const p = toBasePoint(layout, points[k] * toOutput, points[k + 1] * toOutput);
+        source.push(p.x, p.y);
+      }
+      // The radius in source px: how far a brush-radius step on screen goes in the image.
+      const a = toBasePoint(layout, points[0] * toOutput, points[1] * toOutput);
+      const b = toBasePoint(layout, (points[0] + brushSize / 2) * toOutput, points[1] * toOutput);
+      props.onHeal(source, Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)));
+    };
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  };
+  const onBrushHover = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (tool === 'fill') return onFillHover(e);
+    if (tool !== 'heal') return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    setBrushAt({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+  };
+
+  /** Fill by part: which part is under the pointer (it's highlighted, and a click fills just it). */
+  const [hoverPart, setHoverPart] = useState(-1);
+  const partsRef = useRef<HTMLCanvasElement>(null);
+  const { fillParts } = props;
+  const onFillHover = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!layout || !fillParts) return setHoverPart(-1);
+    const p = canvasPoint(e.clientX, e.clientY);
+    const s = toSourcePoint(layout, p.x, p.y);
+    const x = Math.floor(s.x);
+    const y = Math.floor(s.y);
+    const part = x >= 0 && y >= 0 && x < fillParts.width && y < fillParts.height ? fillParts.labels[y * fillParts.width + x] : -1;
+    setHoverPart(part);
+  };
+  // Tint the hovered part on an overlay, placed exactly over the artwork.
+  useEffect(() => {
+    const overlay = partsRef.current;
+    if (!overlay || !layout) return;
+    overlay.width = layout.width;
+    overlay.height = layout.height;
+    const ctx = overlay.getContext('2d')!;
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    const L = fillParts?.layers[hoverPart];
+    if (!fillParts || !L) return;
+    const mask = new ImageData(L.w, L.h);
+    for (let y = 0; y < L.h; y++) {
+      for (let x = 0; x < L.w; x++) {
+        if (fillParts.labels[(L.y + y) * fillParts.width + L.x + x] !== hoverPart) continue;
+        const q = (y * L.w + x) * 4;
+        mask.data.set([91, 76, 240, 110], q);
+      }
+    }
+    const piece = document.createElement('canvas');
+    piece.width = L.w;
+    piece.height = L.h;
+    piece.getContext('2d')!.putImageData(mask, 0, 0);
+    // Source px → output px is affine: read it off three mapped points.
+    const o = fromSourcePoint(layout, 0, 0);
+    const ax = fromSourcePoint(layout, 1, 0);
+    const ay = fromSourcePoint(layout, 0, 1);
+    ctx.setTransform(ax.x - o.x, ax.y - o.y, ay.x - o.x, ay.y - o.y, o.x, o.y);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(piece, L.x, L.y);
+  }, [hoverPart, fillParts, layout]);
 
   const textOf = (target: Target) => {
     const id = textIdOf(target);
@@ -281,20 +371,30 @@ export function RemoverPreview(props: RemoverPreviewProps) {
   };
 
   /** Deletes element `i` and puts editable text in its place, matching its position, angle, size and color. */
+  /** Deletes element `i` — with the rest of its line of letters — and puts editable text in its place, matching its position, angle, size and color. */
   const replaceWithText = (i: number) => {
-    if (!layout?.layers) return;
-    const b = layerBox(layout, i);
+    const set = layout?.layers;
+    if (!layout || !set) return;
+    const line = linePieces(cutout, set, i).filter((j) => !layout.layerTransforms[j]?.hidden);
+    const boxes = line.map((j) => layerBox(layout, j));
+    const x0 = Math.min(...boxes.map((b) => b.x - b.w / 2));
+    const x1 = Math.max(...boxes.map((b) => b.x + b.w / 2));
+    // Size and height from the tallest letters (capitals, digits), not ascenders plus descenders.
+    const tallest = Math.max(...boxes.map((b) => b.h));
+    const caps = boxes.filter((b) => b.h >= tallest * 0.8);
+    const capH = caps.reduce((sum, b) => sum + b.h, 0) / caps.length;
+    const cy = caps.reduce((sum, b) => sum + b.y, 0) / caps.length;
     props.onAddText(
       {
         text: 'New text',
-        x: b.x / layout.width,
-        y: b.y / layout.height,
-        // The drawn letters are roughly 0.72 of the font size tall.
-        size: clamp(b.h / 0.72 / layout.height, 0.02, 0.8),
-        rotate: Math.round((b.rotate * 180) / Math.PI),
-        color: layerColor(cutout, layout.layers, i),
+        x: (x0 + x1) / 2 / layout.width,
+        y: cy / layout.height,
+        // Capitals are roughly 0.72 of the font size tall.
+        size: clamp(capH / 0.72 / layout.height, 0.02, 0.8),
+        rotate: Math.round((layerBox(layout, i).rotate * 180) / Math.PI),
+        color: inkColor(cutout, set, line),
       },
-      i,
+      line,
     );
   };
 
@@ -358,7 +458,7 @@ export function RemoverPreview(props: RemoverPreviewProps) {
     const set = layout?.layers;
     if (!set) return -1;
     const hit = hitTest(layout, x, y).layer;
-    if (hit >= 0 && visibleLayer(hit)) return hit;
+    if (hit >= 0 && visibleLayer(hit)) return wordFirst(hit);
     let best = -1;
     let bestArea = Infinity;
     set.layers.forEach((_, i) => {
@@ -369,7 +469,15 @@ export function RemoverPreview(props: RemoverPreviewProps) {
         bestArea = b.w * b.h;
       }
     });
-    return best;
+    return best >= 0 ? wordFirst(best) : best;
+  };
+  /** A letter of a word picks the whole word first; once that word (or one of its letters) is selected, the letter. */
+  const wordFirst = (i: number) => {
+    const set = layout?.layers;
+    const w = set?.layers[i]?.parent;
+    if (!set || w == null || !set.layers[w]?.word || !visibleLayer(w)) return i;
+    const inWord = selected === w || (typeof selected === 'number' && set.layers[selected]?.parent === w);
+    return inWord ? i : w;
   };
 
   /** Edit tool: pick what's under the pointer and start dragging it straight away. Elements always win over the whole image. */
@@ -422,7 +530,13 @@ export function RemoverPreview(props: RemoverPreviewProps) {
   // the chosen colour fills the *entire* preview area behind the transparent canvas.
   const hasBackground = Boolean(options.background) && !options.knockout;
   const stageStyle = hasBackground ? { backgroundColor: options.background as string } : undefined;
-  const selectable = editing && layout.layers ? layout.layers.layers.flatMap((_, i) => (visibleLayer(i) ? [i] : [])) : [];
+  // Outlines: the main elements, plus the letters of a selected word (or of the word a selected letter is in).
+  const set = layout?.layers;
+  const openWord = typeof selected === 'number' && set ? (set.layers[selected]?.word ? selected : set.layers[selected]?.parent) : null;
+  const outlined =
+    editing && set
+      ? set.layers.flatMap((L, i) => ((L.outlined || (openWord != null && L.parent === openWord)) && visibleLayer(i) ? [i] : []))
+      : [];
   const selectedText = selected !== null ? textOf(selected) : null;
 
   const boxStyle = (b: Box) => ({
@@ -455,11 +569,11 @@ export function RemoverPreview(props: RemoverPreviewProps) {
 
   const toggle = (active: boolean) =>
     `inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition-colors ${
-      active ? 'bg-surface text-text shadow-soft' : 'text-muted hover:text-text'
+      active ? 'bg-primary-soft text-primary shadow-soft ring-1 ring-inset ring-primary/40' : 'text-muted hover:bg-surface hover:text-text'
     }`;
   const iconToggle = (active: boolean) =>
     `inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:pointer-events-none disabled:opacity-40 ${
-      active ? 'bg-surface text-text shadow-soft' : 'text-muted hover:text-text'
+      active ? 'bg-primary-soft text-primary shadow-soft ring-1 ring-inset ring-primary/40' : 'text-muted hover:bg-surface hover:text-text'
     }`;
 
   return (
@@ -496,6 +610,44 @@ export function RemoverPreview(props: RemoverPreviewProps) {
               {t.icon} {t.label}
             </button>
           ))}
+          {tool === 'heal' && (
+            <label className="my-auto ml-1 flex items-center gap-1.5 text-xs text-muted" title="Brush size">
+              Size
+              <input
+                type="range"
+                min={4}
+                max={120}
+                value={brushSize}
+                onChange={(e) => setBrushSize(Number(e.target.value))}
+                aria-label="Brush size"
+                className="w-20"
+              />
+            </label>
+          )}
+          {tool === 'fill' && (
+            <div className="my-auto ml-1 flex rounded-md bg-surface p-0.5" role="radiogroup" aria-label="Fill what">
+              {(
+                [
+                  ['part', 'One part', 'Fill just the part you click (a letter, a shape, a card)'],
+                  ['color', 'Similar color', 'Fill everything of a similar color that touches the click'],
+                ] as const
+              ).map(([value, label, title]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={props.fillMode === value}
+                  title={title}
+                  onClick={() => props.onFillModeChange(value)}
+                  className={`h-6 rounded px-2 text-xs font-medium transition-colors ${
+                    props.fillMode === value ? 'bg-primary-soft text-primary' : 'text-muted hover:text-text'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           {tool === 'fill' && (
             <label
               className="relative my-auto ml-1 h-6 w-6 shrink-0 cursor-pointer overflow-hidden rounded-full border border-border"
@@ -670,12 +822,45 @@ export function RemoverPreview(props: RemoverPreviewProps) {
           <canvas
             ref={canvasRef}
             onClick={onClick}
-            className={`block max-h-[70vh] max-w-full touch-none object-contain ${editing ? 'cursor-move outline-1 outline-dashed outline-border-strong' : 'cursor-crosshair'}`}
+            onPointerDown={onBrushDown}
+            onPointerMove={onBrushHover}
+            onPointerLeave={() => {
+              setBrushAt(null);
+              setHoverPart(-1);
+            }}
+            className={`block max-h-[70vh] max-w-full touch-none object-contain ${editing ? 'cursor-move outline-1 outline-dashed outline-border-strong' : tool === 'heal' ? 'cursor-none' : 'cursor-crosshair'}`}
             role="img"
-            aria-label={tool === 'edit' ? 'Result preview.' : `Result preview. Click to ${tool === 'remove' ? 'erase' : tool} a region.`}
+            aria-label={
+              tool === 'edit'
+                ? 'Result preview.'
+                : tool === 'heal'
+                  ? 'Result preview. Paint over anything to replace it with the background around it.'
+                  : `Result preview. Click to ${tool === 'remove' ? 'erase' : tool} a region.`
+            }
           />
+          {tool === 'fill' && fillParts && (
+            <canvas ref={partsRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true" />
+          )}
+          {tool === 'heal' && (stroke || brushAt) && (
+            <svg className="pointer-events-none absolute inset-0 h-full w-full overflow-visible" aria-hidden="true">
+              {stroke && (
+                <polyline
+                  points={stroke.join(' ')}
+                  fill="none"
+                  stroke="var(--primary)"
+                  strokeOpacity={0.45}
+                  strokeWidth={brushSize}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )}
+              {brushAt && (
+                <circle cx={brushAt.x} cy={brushAt.y} r={brushSize / 2} fill="none" stroke="var(--primary)" strokeWidth={1.5} />
+              )}
+            </svg>
+          )}
           {editing && selected !== 'all' &&
-            selectable.map(
+            outlined.map(
               (i) =>
                 i !== selected && (
                   <div

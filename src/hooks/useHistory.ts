@@ -8,6 +8,17 @@ const LIMIT = 200;
  */
 const MERGE_MS = 700;
 
+/** Structural equality for plain state (objects, arrays, primitives). */
+function isEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && isEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
 interface History<T> {
   past: T[];
   present: T;
@@ -28,8 +39,18 @@ export function useHistory<T>(initial: T) {
     last.current = { group, at: now };
     setHistory((h) => {
       const next = typeof update === 'function' ? (update as (prev: T) => T)(h.present) : update;
-      if (Object.is(next, h.present)) return h;
-      if (merge) return { past: h.past, present: next, future: [] };
+      // A change that leaves everything as it was isn't a step.
+      if (isEqual(next, h.present)) return h;
+      if (merge) {
+        // A merged drag that ends back where it started cancels its step.
+        const before = h.past[h.past.length - 1];
+        if (h.past.length && isEqual(next, before)) {
+          // Moving on from here starts a fresh step rather than merging into the previous one.
+          last.current.group = null;
+          return { past: h.past.slice(0, -1), present: before, future: [] };
+        }
+        return { past: h.past, present: next, future: [] };
+      }
       return { past: [...h.past, h.present].slice(-LIMIT), present: next, future: [] };
     });
   }, []);

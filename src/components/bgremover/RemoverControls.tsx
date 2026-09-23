@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Bold, Copy, Download, FlipHorizontal2, FlipVertical2, ImagePlus, Italic, Loader2, Redo2, RotateCcw, RotateCw, Trash2, Type, Undo2 } from 'lucide-react';
 import { ColorPicker } from '../editor/ColorPicker';
 import { RangeField } from '../editor/RangeField';
@@ -6,6 +6,7 @@ import { BackgroundControl } from '../editor/BackgroundControl';
 import { Switch } from '../common/Switch';
 import type { RemovalSettings } from '../../utils/backgroundRemoval';
 import { IDENTITY_TRANSFORM, type ImageTransform, type TextItem } from '../../utils/imageCompose';
+import { FONT_GROUPS, TEXT_FONTS } from '../../utils/textFonts';
 
 export type RasterFormat = 'png' | 'jpeg' | 'webp';
 
@@ -36,15 +37,7 @@ export interface StyleState {
   texts: TextItem[];
 }
 
-/** Fonts available for added text: system stacks, so they render the same in the preview and the export. */
-export const TEXT_FONTS = [
-  { label: 'Sans', value: 'Inter, "Helvetica Neue", Arial, sans-serif' },
-  { label: 'Rounded', value: '"Trebuchet MS", "Segoe UI", Verdana, sans-serif' },
-  { label: 'Heavy', value: 'Impact, "Arial Black", Haettenschweiler, sans-serif' },
-  { label: 'Serif', value: 'Georgia, "Times New Roman", serif' },
-  { label: 'Mono', value: '"Courier New", Courier, monospace' },
-  { label: 'Script', value: '"Brush Script MT", "Segoe Script", "Comic Sans MS", cursive' },
-] as const;
+export { TEXT_FONTS };
 
 export interface ElementEdit {
   anchor: number;
@@ -290,22 +283,8 @@ export function RemoverControls(p: RemoverControlsProps) {
           </div>
           <div>
             <span className="mb-2 block text-sm font-medium">Font</span>
-            <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Font">
-              {TEXT_FONTS.map((f) => (
-                <button
-                  key={f.label}
-                  type="button"
-                  aria-pressed={p.selectedText!.font === f.value}
-                  onClick={() => p.onTextChange({ font: f.value })}
-                  style={{ fontFamily: f.value }}
-                  className={`rounded-md border px-2 py-1.5 text-sm transition-colors ${
-                    p.selectedText!.font === f.value ? 'border-primary bg-primary-soft text-primary' : 'border-border text-muted hover:text-text'
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
+            {p.selectedText.matches?.length ? <MatchedFonts text={p.selectedText} onUse={p.onTextChange} /> : null}
+            <FontPicker value={p.selectedText.font} onChange={(font) => p.onTextChange({ font })} />
           </div>
           <div className="flex gap-1.5">
             {(
@@ -329,14 +308,7 @@ export function RemoverControls(p: RemoverControlsProps) {
               </button>
             ))}
           </div>
-          <RangeField
-            label="Size"
-            value={Math.round(p.selectedText.size * 100)}
-            min={1}
-            max={80}
-            unit="%"
-            onChange={(v) => p.onTextChange({ size: v / 100 })}
-          />
+          <TextSize size={p.selectedText.size} canvasHeight={p.outputSize.height} onChange={(size) => p.onTextChange({ size })} />
           <RangeField label="Rotate" value={Math.round(p.selectedText.rotate)} min={-180} max={180} unit="°" onChange={(rotate) => p.onTextChange({ rotate })} />
           <ColorPicker label="Text color" value={p.selectedText.color} onChange={(color) => p.onTextChange({ color })} />
           <button
@@ -552,5 +524,110 @@ export function RemoverControls(p: RemoverControlsProps) {
         {style.transparent && <p className="text-xs text-muted">JPG doesn’t support transparency, so it’s exported on white.</p>}
       </Section>
     </aside>
+  );
+}
+
+/** The fonts closest to the image's lettering, each shown in itself; the one in use is marked. */
+function MatchedFonts({ text, onUse }: { text: TextItem; onUse: (patch: Partial<TextItem>) => void }) {
+  const matches = text.matches!;
+  return (
+    <div className="mb-2 rounded-md bg-primary-soft p-2">
+      <p className="mb-1.5 text-xs text-primary">Closest to the lettering in your image:</p>
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label="Font matches">
+        {matches.map((m, k) => {
+          const active = text.font === m.font && text.bold === m.bold && text.italic === m.italic;
+          return (
+            <button
+              key={`${m.font}|${m.bold}|${m.italic}`}
+              type="button"
+              aria-pressed={active}
+              onClick={() => onUse({ font: m.font, bold: m.bold, italic: m.italic })}
+              style={{ fontFamily: m.font, fontWeight: m.bold ? 700 : 400, fontStyle: m.italic ? 'italic' : 'normal' }}
+              title={`${m.label}${m.bold ? ' Bold' : ''}${m.italic ? ' Italic' : ''}${k === 0 ? ' (closest)' : ''}`}
+              className={`rounded-md border bg-surface px-2 py-1 text-sm transition-colors ${
+                active ? 'border-primary text-primary' : 'border-transparent text-text hover:border-border'
+              }`}
+            >
+              {m.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Every offered font, grouped by style and searchable, each shown in itself. */
+function FontPicker({ value, onChange }: { value: string; onChange: (font: string) => void }) {
+  const [query, setQuery] = useState('');
+  const q = query.trim().toLowerCase();
+  const shown = TEXT_FONTS.filter((f) => !q || f.label.toLowerCase().includes(q) || f.group.toLowerCase().includes(q));
+  return (
+    <div className="rounded-lg border border-border">
+      <input
+        type="search"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder={`Search ${TEXT_FONTS.length} fonts`}
+        aria-label="Search fonts"
+        className="h-9 w-full rounded-t-lg border-b border-border bg-surface px-3 text-sm outline-none focus:border-primary"
+      />
+      <div className="max-h-56 overflow-y-auto p-1" role="listbox" aria-label="Font">
+        {FONT_GROUPS.map((group) => {
+          const fonts = shown.filter((f) => f.group === group);
+          if (!fonts.length) return null;
+          return (
+            <div key={group} role="group" aria-label={group}>
+              <p className="px-2 pb-0.5 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted">{group}</p>
+              {fonts.map((f) => (
+                <button
+                  key={f.label}
+                  type="button"
+                  role="option"
+                  aria-selected={value === f.value}
+                  onClick={() => onChange(f.value)}
+                  style={{ fontFamily: f.value }}
+                  className={`block w-full truncate rounded-md px-2 py-1 text-left text-[15px] transition-colors ${
+                    value === f.value ? 'bg-primary-soft text-primary' : 'text-text hover:bg-surface-2'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          );
+        })}
+        {!shown.length && <p className="px-2 py-3 text-center text-xs text-muted">No font matches “{query}”.</p>}
+      </div>
+    </div>
+  );
+}
+
+const SIZE_PRESETS = [12, 16, 20, 24, 32, 48, 64, 96, 128];
+
+/** Text size in px of the downloaded image (stored as a share of its height), with common sizes one click away. */
+function TextSize({ size, canvasHeight, onChange }: { size: number; canvasHeight: number; onChange: (size: number) => void }) {
+  const h = Math.max(1, canvasHeight);
+  const px = Math.round(size * h);
+  const max = Math.max(200, Math.round(h * 0.8));
+  return (
+    <div>
+      <RangeField label="Size" value={px} min={4} max={max} unit="px" onChange={(v) => onChange(v / h)} />
+      <div className="mt-2 flex flex-wrap gap-1" role="group" aria-label="Common sizes">
+        {SIZE_PRESETS.filter((s) => s <= max).map((s) => (
+          <button
+            key={s}
+            type="button"
+            aria-pressed={px === s}
+            onClick={() => onChange(s / h)}
+            className={`h-7 min-w-9 rounded-md border px-1.5 text-xs tabular-nums transition-colors ${
+              px === s ? 'border-primary bg-primary-soft text-primary' : 'border-border text-muted hover:text-text'
+            }`}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
