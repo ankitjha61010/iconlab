@@ -1,0 +1,940 @@
+App NAme:- IconLab
+
+You are an expert frontend engineer and UI/UX designer.
+
+Build a production-ready web application called:
+
+# IconLab
+
+Tagline:
+"Discover. Customize. Download."
+
+The application should be a Flaticon-style icon discovery and customization platform, but with its own branding and UI.
+
+IMPORTANT:
+- This is a FRONTEND-ONLY application.
+- There is NO backend.
+- The application will be deployed directly to NETLIFY.
+- Do not create Node/Express/NestJS backend APIs.
+- Do not create authentication.
+- Do not create a database.
+- All icon data should come from the public Iconify API.
+- All customization and file generation must happen in the browser.
+- Do not use fake/mock icons when the real Iconify API can provide the data.
+
+Use the attached Flaticon screenshots as the visual reference for layout, spacing, information hierarchy, search experience, filters, icon grid, and overall professional feel.
+
+DO NOT copy Flaticon branding, logo, exact colors, or proprietary UI.
+Create an original product called IconLab.
+
+==================================================
+TECH STACK
+==================================================
+
+Use:
+
+- React
+- TypeScript
+- Vite
+- Tailwind CSS
+- Lucide React for application UI icons
+- Iconify API for icon data
+- Modern React functional components
+- React hooks
+- No backend
+- No unnecessary libraries
+
+Keep the project clean and production-ready.
+
+==================================================
+CORE PRODUCT IDEA
+==================================================
+
+IconLab allows users to:
+
+1. Search icons
+2. Browse icon collections
+3. Filter icons
+4. Preview icons
+5. Customize icons
+6. Change colors
+7. Change size
+8. Rotate/flip icons
+9. Customize background
+10. Download as SVG
+11. Download as PNG
+12. Download as JPEG
+13. Copy SVG code
+14. Copy HTML/SVG code
+15. Copy React code
+16. Copy React Native code where possible
+17. Open an icon in a dedicated editor
+
+Everything should work completely on the client side.
+
+==================================================
+ICON SOURCE
+==================================================
+
+Use Iconify as the primary icon provider.
+
+Use the Iconify public API for:
+
+- searching icons
+- retrieving icon metadata
+- retrieving SVG data
+- browsing icon collections
+- retrieving collection information
+
+Do not hardcode thousands of icons.
+
+The application should dynamically fetch icons from Iconify.
+
+Create a small service layer:
+
+src/
+  services/
+    iconifyService.ts
+
+Keep all Iconify API calls inside this service.
+
+Do not scatter fetch() calls throughout components.
+
+==================================================
+IMPORTANT LICENSING HANDLING
+==================================================
+
+The application must NOT claim that every Iconify icon is automatically free for every commercial use.
+
+Show the icon collection/provider information when appropriate.
+
+Where Iconify provides license/source information, display it in the icon details/editor.
+
+For example:
+
+Source:
+Material Design Icons
+
+License:
+Apache 2.0
+
+Add a small:
+
+"View license"
+
+or
+
+"Icon source"
+
+section.
+
+Do not make unsupported claims about licensing.
+
+==================================================
+APPLICATION STRUCTURE
+==================================================
+
+Create these major screens:
+
+1. Home
+2. Search Results
+3. Icon Details / Editor
+4. Collections
+5. Favorites
+
+==================================================
+1. HOME PAGE
+==================================================
+
+Create a premium landing page inspired by the structure of the attached Flaticon screenshot.
+
+Header:
+
+------------------------------------------------
+IconLab       Icons   Collections   Favorites
+                         Search
+------------------------------------------------
+
+IconLab logo should be original.
+
+Do NOT copy the Flaticon logo.
+
+Hero section:
+
+"Millions of icons, one creative workspace."
+
+Subtitle:
+
+"Search, customize and download icons for your next project."
+
+Large search bar:
+
+[ Icons ▼ ] [ Search icons...                    ] [ Search ]
+
+Below search:
+
+Popular searches:
+
+User
+Business
+Food
+Technology
+Security
+Education
+Home
+Social
+
+Then show popular categories / collections.
+
+Examples:
+
+- Interface
+- Business
+- People
+- Technology
+- Communication
+- Education
+- E-commerce
+- Social
+- Travel
+- Food
+- Medical
+- Finance
+
+Use real Iconify collections/icons where possible.
+
+==================================================
+2. SEARCH RESULTS
+==================================================
+
+When user searches:
+
+"user"
+
+URL should become something like:
+
+/icons?q=user
+
+Build a search results interface similar in concept to the second attached screenshot.
+
+Desktop layout:
+
+---------------------------------------------------------
+Header
+---------------------------------------------------------
+
+Search bar
+
+---------------------------------------------------------
+Filters       | Results
+               |
+               | User Icons
+               |
+               | [icon][icon][icon][icon][icon]
+               | [icon][icon][icon][icon][icon]
+               | [icon][icon][icon][icon][icon]
+---------------------------------------------------------
+
+LEFT SIDEBAR:
+
+Filters
+
+Colors
+
+[ Black ]
+[ Colors ]
+[ Gradient ]
+
+Style
+
+[ Outline ]
+[ Filled ]
+[ Duotone ]
+[ Lineal ]
+[ Hand Drawn ]
+
+Collections
+
+[ Material ]
+[ Font Awesome ]
+[ Tabler ]
+[ Heroicons ]
+[ Bootstrap ]
+etc.
+
+Sort:
+
+[ Popular ]
+[ Recent ]
+
+Make filters functional where possible.
+
+Do not create fake filtering logic.
+
+If a filter cannot be accurately applied through the Iconify API, implement it based on the actual returned icon metadata or available collection data.
+
+==================================================
+ICON GRID
+==================================================
+
+Create a beautiful responsive icon grid.
+
+Each icon card should contain:
+
+- Icon preview
+- Icon name
+- Collection name
+- Favorite button
+
+Example:
+
+┌─────────────────┐
+│                 │
+│       ICON      │
+│                 │
+│                 │
+├─────────────────┤
+│ user            │
+│ Material Design │
+└─────────────────┘
+
+Hover:
+
+- subtle border
+- subtle shadow
+- preview background
+- favorite button
+- quick "Customize" action
+
+Do NOT make the UI visually heavy.
+
+The icon should remain the primary focus.
+
+==================================================
+3. ICON EDITOR
+==================================================
+
+This is the MOST IMPORTANT part of the application.
+
+When the user clicks an icon, open:
+
+/icon/:collection/:icon
+
+Create a professional icon customization editor.
+
+Desktop layout:
+
+--------------------------------------------------------------
+Header
+--------------------------------------------------------------
+
+| Preview Area                    | Customization Panel     |
+|                                 |                         |
+|                                 | Color                   |
+|                                 | [ color picker ]        |
+|                                 |                         |
+|          ICON                   | Background              |
+|                                 | [ color picker ]        |
+|                                 |                         |
+|                                 | Size                    |
+|                                 | [ slider ]              |
+|                                 |                         |
+|                                 | Rotation                |
+|                                 | [ slider ]              |
+|                                 |                         |
+|                                 | Flip                    |
+|                                 | [ Horizontal ]          |
+|                                 | [ Vertical ]            |
+|                                 |                         |
+|                                 | Download                |
+|                                 | [ SVG ] [ PNG ] [ JPG ] |
+--------------------------------------------------------------
+
+==================================================
+CUSTOMIZATION
+==================================================
+
+Support:
+
+1. Icon color
+2. Background color
+3. Transparent background
+4. Size
+5. Rotation
+6. Horizontal flip
+7. Vertical flip
+8. Padding
+9. Border radius for background
+10. Preview background/grid
+
+Use real color pickers.
+
+Display HEX value:
+
+#000000
+
+Allow the user to manually enter HEX values.
+
+For SVG icons that use currentColor or fill/stroke values, modify the SVG appropriately.
+
+Do not destroy the SVG structure unnecessarily.
+
+==================================================
+MULTICOLOR ICONS
+==================================================
+
+Important:
+
+Not every SVG icon is a single-color icon.
+
+For simple icons:
+
+Allow changing the main color.
+
+For multicolor icons:
+
+Preserve the original colors unless the SVG structure allows safe color replacement.
+
+Do NOT blindly replace every fill value in every SVG.
+
+Create a safe SVG transformation utility.
+
+Example:
+
+src/
+  utils/
+    svgUtils.ts
+
+==================================================
+DOWNLOADS
+==================================================
+
+Everything must happen client-side.
+
+SVG:
+
+Download the modified SVG directly.
+
+PNG:
+
+Convert SVG to PNG in the browser using:
+
+SVG
+↓
+Blob/Image
+↓
+Canvas
+↓
+PNG
+
+JPEG:
+
+SVG
+↓
+Canvas with background
+↓
+JPEG
+
+The user should be able to select:
+
+PNG
+JPEG
+SVG
+
+and download immediately.
+
+No backend upload should be required.
+
+==================================================
+COPY CODE
+==================================================
+
+Add:
+
+Copy SVG
+
+Copy HTML
+
+Copy React
+
+Copy React Native
+
+Example React output:
+
+import { Icon } from '@iconify/react';
+
+<Icon
+  icon="mdi:home"
+  width={32}
+  color="#000000"
+/>
+
+Use the actual selected icon name.
+
+For React Native, if direct Iconify usage is not appropriate for the selected icon, provide the most appropriate SVG-based usage and clearly label it.
+
+Do not generate fake code.
+
+==================================================
+ICON DETAILS
+==================================================
+
+Show:
+
+Icon name
+
+Collection
+
+Provider
+
+License
+
+Iconify identifier
+
+Example:
+
+User
+
+Material Design Icons
+
+mdi
+
+Apache 2.0
+
+Actions:
+
+[ Customize ]
+
+[ Copy SVG ]
+
+[ Download ]
+
+[ Favorite ]
+
+==================================================
+FAVORITES
+==================================================
+
+Since there is no backend:
+
+Use localStorage.
+
+Users can:
+
+- favorite icons
+- unfavorite icons
+- view favorites
+
+Create:
+
+src/
+  hooks/
+    useFavorites.ts
+
+Favorites should survive page refresh.
+
+No login required.
+
+==================================================
+RECENTLY VIEWED
+==================================================
+
+Also use localStorage.
+
+Store recently viewed icons.
+
+Limit to approximately 20 items.
+
+Show them on the home page.
+
+==================================================
+SEARCH EXPERIENCE
+==================================================
+
+Search should feel fast.
+
+Add:
+
+- search suggestions
+- recent searches
+- popular searches
+- loading state
+- empty state
+- error state
+
+Debounce search requests.
+
+Do not call the API on every keystroke.
+
+Use a reasonable debounce.
+
+Support pagination/infinite scrolling if practical.
+
+Avoid loading hundreds of icons at once.
+
+==================================================
+PERFORMANCE
+==================================================
+
+This is very important.
+
+Do NOT load all icons on initial page load.
+
+Use:
+
+- lazy loading
+- pagination
+- debounced search
+- image/SVG lazy rendering
+- caching where useful
+- AbortController for cancelled searches
+- localStorage for recent searches/favorites
+
+Avoid unnecessary re-renders.
+
+==================================================
+RESPONSIVE DESIGN
+==================================================
+
+Desktop:
+
+Full sidebar + grid.
+
+Tablet:
+
+Collapsible sidebar.
+
+Mobile:
+
+Bottom/filter button.
+
+Grid should adapt:
+
+Desktop:
+6–8 icons per row depending on screen width.
+
+Tablet:
+4–6.
+
+Mobile:
+2–3.
+
+Editor on mobile should become:
+
+Preview
+↓
+Customization
+↓
+Download
+
+==================================================
+HEADER
+==================================================
+
+Create a professional dark header similar in density to the reference screenshot but with ORIGINAL IconLab branding.
+
+Navigation:
+
+IconLab
+
+Icons
+Collections
+Favorites
+
+Right:
+
+Search
+Theme toggle
+
+Do not copy Flaticon branding.
+
+==================================================
+DESIGN SYSTEM
+==================================================
+
+Create a modern SaaS/design-tool visual language.
+
+Use:
+
+- clean white/gray surfaces
+- dark text
+- subtle borders
+- rounded corners
+- subtle shadows
+- professional typography
+- generous spacing
+
+Primary brand color should be original to IconLab.
+
+Avoid copying Flaticon green exactly.
+
+Use CSS variables/design tokens for:
+
+--primary
+--background
+--surface
+--border
+--text
+--muted
+--danger
+
+==================================================
+DARK MODE
+==================================================
+
+Implement dark mode.
+
+Persist preference in localStorage.
+
+The entire app should support:
+
+Light
+Dark
+
+Do not leave individual components broken in dark mode.
+
+==================================================
+ERROR HANDLING
+==================================================
+
+Handle:
+
+- Iconify API unavailable
+- network failure
+- invalid icon
+- missing SVG
+- empty search
+- rate limiting
+- invalid API response
+
+Display friendly UI.
+
+Example:
+
+"Unable to load icons right now. Please try again."
+
+Do not expose raw API errors to users.
+
+==================================================
+COMPONENT ARCHITECTURE
+==================================================
+
+Use reusable components.
+
+Example:
+
+src/
+
+components/
+  layout/
+    Header.tsx
+    Footer.tsx
+
+  icons/
+    IconCard.tsx
+    IconGrid.tsx
+    IconPreview.tsx
+    IconSearch.tsx
+    IconFilters.tsx
+    IconSkeleton.tsx
+    FavoriteButton.tsx
+
+  editor/
+    IconEditor.tsx
+    ColorPicker.tsx
+    SizeControl.tsx
+    RotationControl.tsx
+    BackgroundControl.tsx
+    DownloadPanel.tsx
+    CodePanel.tsx
+
+  common/
+    Button.tsx
+    Input.tsx
+    Modal.tsx
+    Dropdown.tsx
+    Tooltip.tsx
+
+pages/
+  Home.tsx
+  SearchResults.tsx
+  IconDetails.tsx
+  Favorites.tsx
+  Collections.tsx
+
+services/
+  iconifyService.ts
+
+hooks/
+  useIcons.ts
+  useFavorites.ts
+  useRecentIcons.ts
+  useDebounce.ts
+
+utils/
+  svgUtils.ts
+  imageExport.ts
+  downloadUtils.ts
+
+types/
+  icon.ts
+
+==================================================
+NETLIFY REQUIREMENTS
+==================================================
+
+The project must work on Netlify.
+
+Do not require:
+
+- backend server
+- server-side database
+- environment variables for the basic Iconify functionality
+- API keys if the public Iconify endpoints do not require one
+
+Create Netlify SPA routing configuration so that routes such as:
+
+/
+/icons
+/icon/:collection/:icon
+/favorites
+/collections
+
+work correctly after refreshing the page.
+
+Add:
+
+public/_redirects
+
+with the appropriate SPA fallback.
+
+==================================================
+IMPORTANT SECURITY / ARCHITECTURE RULE
+==================================================
+
+Do not pretend that hiding API calls is possible.
+
+The browser must call the Iconify API directly.
+
+Do not put fake secrets/API keys in frontend code.
+
+If an API key is ever required by a future provider, explain that a backend/proxy would be required instead of exposing the key.
+
+For the current Iconify integration, use the public API where appropriate.
+
+==================================================
+SEO
+==================================================
+
+Add:
+
+- proper page titles
+- meta descriptions
+- Open Graph metadata
+- semantic HTML
+
+Dynamic icon pages should have useful titles.
+
+Example:
+
+"Home Icon - IconLab"
+
+==================================================
+ACCESSIBILITY
+==================================================
+
+Support:
+
+- keyboard navigation
+- visible focus states
+- aria labels
+- accessible buttons
+- accessible color controls
+- sufficient contrast
+- screen-reader-friendly icon names
+
+==================================================
+NO MOCKUP
+==================================================
+
+This must be a REAL WORKING APPLICATION.
+
+Do NOT create a static UI mockup.
+
+The following must actually work:
+
+- Search
+- Icon loading
+- Filters where supported
+- Icon selection
+- Icon customization
+- Color changes
+- Background changes
+- Size
+- Rotation
+- Flip
+- Favorites
+- Recent icons
+- SVG download
+- PNG download
+- JPEG download
+- Copy SVG
+- Copy HTML
+- Copy React
+- Dark mode
+- Responsive layout
+
+==================================================
+IMPORTANT IMPLEMENTATION RULES
+==================================================
+
+1. Do not create a backend.
+2. Do not use fake icon JSON when Iconify can provide real data.
+3. Do not hardcode search results.
+4. Do not copy Flaticon branding.
+5. Do not use copyrighted Flaticon assets.
+6. Keep the UI original but inspired by the attached screenshots.
+7. Keep Iconify integration isolated inside iconifyService.ts.
+8. Use TypeScript everywhere.
+9. Use functional React components.
+10. Keep components reusable.
+11. Avoid giant components.
+12. Handle loading/error/empty states.
+13. Make downloads work entirely in-browser.
+14. Use localStorage for favorites and recent icons.
+15. Make the application Netlify-ready.
+
+==================================================
+FINAL QUALITY CHECK
+==================================================
+
+Before finishing:
+
+- Run the application.
+- Test icon search.
+- Test opening an icon.
+- Test color customization.
+- Test background customization.
+- Test SVG download.
+- Test PNG download.
+- Test JPEG download.
+- Test copy SVG.
+- Test favorites.
+- Test page refresh.
+- Test dark mode.
+- Test mobile layout.
+- Test direct URL navigation.
+- Test Netlify SPA routing.
+- Fix TypeScript errors.
+- Fix console errors.
+- Remove unused imports.
+- Remove mock data that is no longer required.
+- Ensure there are no broken buttons.
+
+The final result should feel like a real product named:
+
+# IconLab
+
+not a coding demo.
+
+Use the attached screenshots as visual inspiration for the overall information architecture and icon-search experience, while creating an original IconLab design system and branding.
