@@ -181,20 +181,11 @@ export function RemoverPreview(props: RemoverPreviewProps) {
   useEffect(() => {
     if (!canvasRef.current) return;
     const longest = Math.max(cutout.width, cutout.height);
-    // Render the canvas with a transparent background — the background colour
-    // is shown via the stage div (filling the entire preview area). A knockout
-    // needs the real background on the canvas so the cut-out shape shows
-    // through to the checkerboard. We also skip the corner-radius clip here;
-    // it only matters on export.
+    // Same as the export (background and rounded corners on the image itself), just smaller.
     const { layout } = composeImage(
       cutout,
       bounds,
-      {
-        ...options,
-        background: options.knockout ? options.background : null,
-        radius: 0, // no clipping in preview; applied only on export
-        size: Math.min(PREVIEW_SIZE, Math.max(MIN_PREVIEW_SIZE, longest)),
-      },
+      { ...options, size: Math.min(PREVIEW_SIZE, Math.max(MIN_PREVIEW_SIZE, longest)) },
       canvasRef.current,
     );
     setLayout(layout);
@@ -526,10 +517,6 @@ export function RemoverPreview(props: RemoverPreviewProps) {
 
   const stageClass = STAGES.find((s) => s.value === stage)!.className;
 
-  // When a solid background colour is chosen, override the stage background so
-  // the chosen colour fills the *entire* preview area behind the transparent canvas.
-  const hasBackground = Boolean(options.background) && !options.knockout;
-  const stageStyle = hasBackground ? { backgroundColor: options.background as string } : undefined;
   // Outlines: the main elements, plus the letters of a selected word (or of the word a selected letter is in).
   const set = layout?.layers;
   const openWord = typeof selected === 'number' && set ? (set.layers[selected]?.word ? selected : set.layers[selected]?.parent) : null;
@@ -682,10 +669,8 @@ export function RemoverPreview(props: RemoverPreviewProps) {
         </div>
       </div>
 
-      {/* Stage area — background colour fills the full area so it's not just around the image edges */}
       <div
-        className={`relative flex min-h-[360px] items-center justify-center overflow-hidden px-4 pb-4 pt-12 sm:min-h-[480px] sm:p-12 ${hasBackground ? '' : stageClass}`}
-        style={stageStyle}
+        className={`relative flex min-h-[360px] items-center justify-center overflow-hidden px-4 pb-4 pt-12 sm:min-h-[480px] sm:p-12 ${stageClass}`}
         onPointerDown={(e) => editing && e.target === e.currentTarget && onSelect(null)}
       >
         {editing && (

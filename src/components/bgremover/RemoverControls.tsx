@@ -59,6 +59,8 @@ interface RemoverControlsProps {
   onSelectedLayerTransform: (patch: Partial<ImageTransform>) => void;
   onDeselect: () => void;
   onStartEditing: () => void;
+  /** Switches the preview to Erase area. */
+  onStartErasing: () => void;
   selectedText: TextItem | null;
   onTextChange: (patch: Partial<TextItem>) => void;
   onAddText: () => void;
@@ -456,6 +458,16 @@ export function RemoverControls(p: RemoverControlsProps) {
           radius={style.radius}
           onChange={(patch) => p.onStyle(patch)}
         />
+        {!style.transparent && p.removedPercent < 0.01 && (
+          <p className="rounded-lg bg-surface-2 px-3 py-2 text-xs text-muted">
+            Nothing has been removed from this image yet, so it covers the background color completely. The color shows only where the
+            image is see-through.{' '}
+            <button type="button" onClick={p.onStartErasing} className="font-medium text-primary hover:underline">
+              Use Erase area
+            </button>{' '}
+            and click the image’s own background (for example the gray between cards) to swap it for this color.
+          </p>
+        )}
         <Switch label="Trim empty space" description="Crop to the visible subject." checked={style.trim} onChange={(trim) => p.onStyle({ trim })} />
         <Switch label="Square canvas" checked={style.square} onChange={(square) => p.onStyle({ square })} />
       </Section>

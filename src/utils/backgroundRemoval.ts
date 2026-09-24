@@ -159,6 +159,47 @@ export function estimateBackground(img: WorkingImage): RGB | null {
   return best ? { r: best.r / best.n, g: best.g / best.n, b: best.b / best.n } : null;
 }
 
+/**
+ * A tolerance that won't swallow big flat areas that are close to, but not, the
+ * background — like white cards on a light-gray app screenshot. Photos and
+ * logos have no such areas and keep `fallback`.
+ */
+export function suggestTolerance(img: WorkingImage, bg: RGB, fallback: number): number {
+  const { width, height, data } = img;
+  const counts = new Map<number, number>();
+  const step = Math.max(1, Math.floor(Math.sqrt((width * height) / 250_000)));
+  let total = 0;
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const i = (y * width + x) * 4;
+      if (data[i + 3] < TRANSPARENT) continue;
+      total++;
+      const key = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  const limit = toDistance(fallback);
+  const near = new Map<number, number>();
+  for (const [key, n] of counts) {
+    // Only large areas of one exact color count; noise and gradients spread over many colors.
+    if (n < total * 0.03) continue;
+    const d = Math.hypot((key >> 16) - bg.r, ((key >> 8) & 255) - bg.g, (key & 255) - bg.b);
+    if (d > 3 && d <= limit) near.set(key, d);
+  }
+  if (!near.size) return fallback;
+  // …and only if the removal would actually reach them (a light body inside a logo's outline is safe).
+  const reached = new Map<number, number>();
+  flood(img, borderSeeds(img), bg, limit, true, (p) => {
+    const key = (data[p * 4] << 16) | (data[p * 4 + 1] << 8) | data[p * 4 + 2];
+    if (near.has(key)) reached.set(key, (reached.get(key) ?? 0) + 1);
+  });
+  let nearest = Infinity;
+  for (const [key, n] of reached) if (n >= width * height * 0.03) nearest = Math.min(nearest, near.get(key)!);
+  if (nearest === Infinity) return fallback;
+  // Stay well below that color, so it and its anti-aliased edges are kept.
+  return Math.max(1, Math.floor((nearest * 0.5) / 2.6));
+}
+
 // ---------------------------------------------------------------------------
 // Mask building
 // ---------------------------------------------------------------------------
@@ -449,15 +490,17 @@ export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[
     const filled = new Uint8Array(width * height);
     const stack = new Int32Array(width * height);
     let top = 0;
+    let [minX, minY, maxX, maxY] = [x, y, x, y];
     filled[seed] = 1;
     stack[top++] = seed;
     while (top > 0) {
       const p = stack[--top];
-      const i = p * 4;
-      px[i] = op.color.r;
-      px[i + 1] = op.color.g;
-      px[i + 2] = op.color.b;
       const cx = p % width;
+      const cy = (p - cx) / width;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
       const push = (q: number) => {
         if (filled[q] || px[q * 4 + 3] < TRANSPARENT || distSq(px, q * 4, target) > limit) return;
         filled[q] = 1;
@@ -468,50 +511,275 @@ export function applyFills(cutout: ImageData, img: WorkingImage, ops: RemovalOp[
       if (p >= width) push(p - width);
       if (p < width * (height - 1)) push(p + width);
     }
-    // Blend the 1px border by how close each pixel is to the filled color.
-    for (let p = 0; p < filled.length; p++) {
-      if (filled[p] || px[p * 4 + 3] < TRANSPARENT) continue;
-      const cx = p % width;
-      const touches =
-        (cx > 0 && filled[p - 1]) || (cx < width - 1 && filled[p + 1]) || (p >= width && filled[p - width]) || (p < width * (height - 1) && filled[p + width]);
-      if (!touches) continue;
-      const i = p * 4;
-      const t = Math.max(0, 1 - Math.sqrt(distSq(px, i, target)) / (dist * 3));
-      px[i] += (op.color.r - px[i]) * t;
-      px[i + 1] += (op.color.g - px[i + 1]) * t;
-      px[i + 2] += (op.color.b - px[i + 2]) * t;
+    // Painted like a part, so the soft edges of text and icons inside it are re-mixed too.
+    const runs: number[] = [];
+    for (let ry = minY; ry <= maxY; ry++) {
+      let start = -1;
+      for (let rx = minX; rx <= maxX + 1; rx++) {
+        const on = rx <= maxX && filled[ry * width + rx] === 1;
+        if (on && start < 0) start = rx;
+        else if (!on && start >= 0) {
+          runs.push(ry - minY, start - minX, rx - start);
+          start = -1;
+        }
+      }
+    }
+    paintPart(cutout, { kind: 'paint', x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, runs, color: op.color });
+  }
+}
+
+/** How close (px) to the part a pocket must stay, and how close in color to it (RGB distance). */
+const POCKET_REACH = 6;
+const POCKET_COLOR = 24;
+/** Bigger text has bigger holes: small areas (this share of the part) may reach further in. */
+const POCKET_SMALL = 0.02;
+const POCKET_SMALL_REACH = 20;
+
+/** Distance (px, 8-connected) of each box pixel from the part, up to `max` (255 beyond), optionally only through `pass` pixels. */
+function distanceFrom(inPart: Uint8Array, bw: number, bh: number, max: number, pass?: (b: number) => boolean) {
+  const n = bw * bh;
+  const reach = new Uint8Array(n).fill(255);
+  let frontier: number[] = [];
+  for (let b = 0; b < n; b++) if (inPart[b]) (reach[b] = 0), frontier.push(b);
+  for (let d = 1; d <= max && frontier.length; d++) {
+    const next: number[] = [];
+    for (const b of frontier) {
+      const bx = b % bw;
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = bx + dx;
+          const q = b + dy * bw + dx;
+          if (xx < 0 || xx >= bw || q < 0 || q >= n || reach[q] <= d || (pass && !pass(q))) continue;
+          reach[q] = d;
+          next.push(q);
+        }
+    }
+    frontier = next;
+  }
+  return reach;
+}
+
+/**
+ * Adds the part's color showing through what's drawn on it — the inside of
+ * letters like "o" or "A", the narrow gaps between bold letters — to the part.
+ * They're areas of about its color that stay within a few px of it, or small
+ * ones (large text) a little further in; bigger ones of that color (a tile, a
+ * circle) stay out.
+ */
+function addPockets(
+  cutout: ImageData,
+  box: { x: number; y: number; w: number; h: number },
+  x0: number,
+  y0: number,
+  bw: number,
+  bh: number,
+  inPart: Uint8Array,
+  pixels: number[],
+) {
+  const { width, data } = cutout;
+  const n = bw * bh;
+  const reach = distanceFrom(inPart, bw, bh, POCKET_SMALL_REACH);
+  const solid = pixels.filter((p) => data[p * 4 + 3] >= 200);
+  if (!solid.length) return;
+  const small = solid.length * POCKET_SMALL;
+  const own = [0, 1, 2].map((k) => {
+    const v = solid.map((p) => data[p * 4 + k]).sort((a, b) => a - b);
+    return v[v.length >> 1];
+  });
+  const like = (b: number) => {
+    const i = ((y0 + Math.floor(b / bw)) * width + x0 + (b % bw)) * 4;
+    return data[i + 3] >= 128 && Math.hypot(data[i] - own[0], data[i + 1] - own[1], data[i + 2] - own[2]) <= POCKET_COLOR;
+  };
+  // How far the part is along what's drawn on it (not across another area of about its color): a pocket
+  // must be ringed by strokes that lead back to the part, so the "0" inside a white circle on a tile isn't one.
+  const viaStrokes = distanceFrom(inPart, bw, bh, POCKET_SMALL_REACH, (b) => !like(b));
+  const seen = new Uint8Array(n);
+  const stack: number[] = [];
+  const region: number[] = [];
+  const [bx0, by0, bx1, by1] = [box.x - x0, box.y - y0, box.x - x0 + box.w, box.y - y0 + box.h];
+  for (let start = 0; start < n; start++) {
+    if (seen[start] || inPart[start] || !like(start)) continue;
+    region.length = 0;
+    let inBox = true;
+    let deepest = 0;
+    let ringed = true;
+    seen[start] = 1;
+    stack.push(start);
+    while (stack.length) {
+      const b = stack.pop()!;
+      region.push(b);
+      const bx = b % bw;
+      const by = (b - bx) / bw;
+      if (reach[b] > deepest) deepest = reach[b];
+      // Running out of the part's box: an area of its own.
+      if (bx < bx0 || by < by0 || bx >= bx1 || by >= by1) inBox = false;
+      for (const q of [bx > 0 ? b - 1 : -1, bx < bw - 1 ? b + 1 : -1, b - bw, b + bw]) {
+        if (q >= 0 && q < n && !inPart[q] && !like(q) && viaStrokes[q] > POCKET_SMALL_REACH) ringed = false;
+        if (q < 0 || q >= n || seen[q] || inPart[q] || !like(q)) continue;
+        seen[q] = 1;
+        stack.push(q);
+      }
+    }
+    if (!inBox || !ringed || !(deepest <= POCKET_REACH || (deepest <= POCKET_SMALL_REACH && region.length <= small))) continue;
+    for (const b of region) {
+      inPart[b] = 1;
+      pixels.push((y0 + Math.floor(b / bw)) * width + x0 + (b % bw));
     }
   }
 }
 
 /**
- * Recolors a part. Its anti-aliased rim is a mix of the part's color and
- * what's next to it, so each pixel gets the color change in proportion to how
- * close it is to the part's own color: the edge stays smooth.
+ * Recolors a part. Pixels well inside it take the new color outright (a
+ * gradient keeps its shading). Anti-aliased pixels on its edges — its own rim
+ * and the soft edges of text or icons drawn on it — are a mix of the part's
+ * color and the other color there, so they are re-mixed with the new color in
+ * the same proportion: lettering stays crisp instead of keeping a pale halo.
  */
 function paintPart(cutout: ImageData, op: Extract<RemovalOp, { kind: 'paint' }>) {
   const { width, height, data } = cutout;
+  const R = 2;
+  const x0 = Math.max(0, op.x - R);
+  const y0 = Math.max(0, op.y - R);
+  const x1 = Math.min(width, op.x + op.w + R);
+  const y1 = Math.min(height, op.y + op.h + R);
+  const bw = x1 - x0;
+  const bh = y1 - y0;
+  if (bw <= 0 || bh <= 0) return;
+  const inPart = new Uint8Array(bw * bh);
   const pixels: number[] = [];
   for (let k = 0; k + 2 < op.runs.length; k += 3) {
     const y = op.y + op.runs[k];
     if (y < 0 || y >= height) continue;
-    for (let x = op.x + op.runs[k + 1], end = x + op.runs[k + 2]; x < end; x++) if (x >= 0 && x < width) pixels.push(y * width + x);
+    for (let x = op.x + op.runs[k + 1], end = x + op.runs[k + 2]; x < end; x++) {
+      if (x < 0 || x >= width) continue;
+      pixels.push(y * width + x);
+      inPart[(y - y0) * bw + (x - x0)] = 1;
+    }
   }
+  if (!pixels.length) return;
+  addPockets(cutout, op, x0, y0, bw, bh, inPart, pixels);
   const solid = pixels.filter((p) => data[p * 4 + 3] >= 200);
   if (!solid.length) return;
-  // The part's own color: the median of its pixels (its rim is the minority).
-  const own = [0, 1, 2].map((k) => {
-    const v = solid.map((p) => data[p * 4 + k]).sort((a, b) => a - b);
-    return v[v.length >> 1];
-  });
-  const dist = (p: number) => Math.hypot(data[p * 4] - own[0], data[p * 4 + 1] - own[1], data[p * 4 + 2] - own[2]);
-  // How far the rim strays from the part's color (the furthest few percent).
-  const far = solid.map(dist).sort((a, b) => a - b)[Math.floor(solid.length * 0.97)] ?? 0;
-  const reach = Math.max(60, far * 1.25);
+  const d2 = (p: number, q: number) => {
+    const i = p * 4;
+    const j = q * 4;
+    return (data[i] - data[j]) ** 2 + (data[i + 1] - data[j + 1]) ** 2 + (data[i + 2] - data[j + 2]) ** 2;
+  };
+  const inside = (x: number, y: number) => x >= x0 && y >= y0 && x < x1 && y < y1 && inPart[(y - y0) * bw + (x - x0)] === 1;
+  // The part and the few px around it (the soft edges of text drawn on it, even in the narrow gaps between
+  // bold letters); nothing further is touched.
+  const near = distanceFrom(inPart, bw, bh, POCKET_REACH).map((d) => (d <= POCKET_REACH ? 1 : 0));
+  /** Pixels with no sharp step around them: an area's plain color there (`plain`: the part's own). */
+  const plainAny = new Uint8Array(bw * bh);
+  const plain = new Uint8Array(bw * bh);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const p = y * width + x;
+      if (data[p * 4 + 3] < 128) continue;
+      let ok = true;
+      for (let dy = -1; dy <= 1 && ok; dy++)
+        for (let dx = -1; dx <= 1 && ok; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= width || yy >= height) continue;
+          const q = yy * width + xx;
+          if (data[q * 4 + 3] >= 128 && d2(p, q) > 12 * 12) ok = false;
+        }
+      plainAny[(y - y0) * bw + (x - x0)] = ok ? 1 : 0;
+      plain[(y - y0) * bw + (x - x0)] = ok && inside(x, y) ? 1 : 0;
+    }
+  }
+  const median = (list: number[]) =>
+    [0, 1, 2].map((k) => {
+      const v = list.map((p) => data[p * 4 + k]).sort((a, b) => a - b);
+      return v[v.length >> 1];
+    });
+  // The part's own color: the median of its plain pixels. Small text has hardly any (it's mostly anti-aliased
+  // edge), so there it's the pixels that stand out most from what's around it: the letters' cores.
+  const plainPixels: number[] = [];
+  const ring: number[] = [];
+  for (let y = y0; y < y1; y++)
+    for (let x = x0; x < x1; x++) {
+      const p = y * width + x;
+      if (plain[(y - y0) * bw + (x - x0)]) plainPixels.push(p);
+      else if (near[(y - y0) * bw + (x - x0)] && !inside(x, y) && data[p * 4 + 3] >= 128) ring.push(p);
+    }
+  let own: number[];
+  if (plainPixels.length >= Math.max(10, solid.length * 0.1) || !ring.length) own = median(plainPixels.length ? plainPixels : solid);
+  else {
+    const around = median(ring);
+    const far = (p: number) => (data[p * 4] - around[0]) ** 2 + (data[p * 4 + 1] - around[1]) ** 2 + (data[p * 4 + 2] - around[2]) ** 2;
+    const sorted = [...solid].sort((a, b) => far(b) - far(a));
+    own = median(sorted.slice(0, Math.max(1, Math.ceil(sorted.length * 0.3))));
+  }
   const shift = [op.color.r - own[0], op.color.g - own[1], op.color.b - own[2]];
-  for (const p of pixels) {
-    const t = Math.max(0, 1 - dist(p) / reach);
-    for (let k = 0; k < 3; k++) data[p * 4 + k] += shift[k] * t;
+  // Decide every pixel's amount first, then paint, so each sees the original colors.
+  const amount = new Float32Array(bw * bh);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const b = (y - y0) * bw + (x - x0);
+      if (plain[b]) {
+        amount[b] = 1;
+        continue;
+      }
+      // Another area's inside (a tile next to the card) is never touched.
+      if (!near[b] || (plainAny[b] && !inPart[b])) continue;
+      const p = y * width + x;
+      if (data[p * 4 + 3] < 8) continue;
+      const local = [0, 0, 0];
+      let n = 0;
+      let others = 0;
+      for (let dy = -R; dy <= R; dy++)
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < x0 || yy < y0 || xx >= x1 || yy >= y1) continue;
+          const c = (yy - y0) * bw + (xx - x0);
+          if (!plain[c]) {
+            if (plainAny[c]) others++;
+            continue;
+          }
+          const q = (yy * width + xx) * 4;
+          local[0] += data[q];
+          local[1] += data[q + 1];
+          local[2] += data[q + 2];
+          n++;
+        }
+      // Mostly next to another area (the edge of text on a tile): that area's business.
+      if (!inPart[b] && others > n) continue;
+      // No plain pixels around (thin strokes like small text): the part's own color stands in.
+      if (n) for (let k = 0; k < 3; k++) local[k] /= n;
+      else local.splice(0, 3, ...own);
+      const i = p * 4;
+      let far = -1;
+      let farD = 0;
+      for (let dy = -R; dy <= R; dy++)
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= width || yy >= height) continue;
+          const q = (yy * width + xx) * 4;
+          if (data[q + 3] < 128) continue;
+          const d = (data[q] - local[0]) ** 2 + (data[q + 1] - local[1]) ** 2 + (data[q + 2] - local[2]) ** 2;
+          if (d > farD) [far, farD] = [q, d];
+        }
+      if (far < 0 || farD < 24 * 24) {
+        if (inside(x, y)) amount[b] = 1;
+        continue;
+      }
+      // How much of the part's color is in this pixel: its position between the other color and the part's.
+      let dot = 0;
+      for (let k = 0; k < 3; k++) dot += (data[i + k] - data[far + k]) * (local[k] - data[far + k]);
+      amount[b] = Math.max(0, Math.min(1, dot / farD));
+    }
+  }
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const t = amount[(y - y0) * bw + (x - x0)];
+      if (!t) continue;
+      const i = (y * width + x) * 4;
+      for (let k = 0; k < 3; k++) data[i + k] += shift[k] * t;
+    }
   }
 }
 

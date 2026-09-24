@@ -463,6 +463,13 @@ const LONE_RIM = 22;
 const BLEND = 40;
 /** How many px into an edge the rim reaches. */
 const RIM_DEPTH = 3;
+/**
+ * A flat area follows slow color changes (gradients) but not short fades, like
+ * a rounded corner's anti-aliasing between a card and a slightly grayer tile:
+ * each pixel is compared with a running average of the path that reached it.
+ */
+const DRIFT = 6;
+const DRIFT_RATE = 0.1;
 
 /**
  * Parts inside split groups. Flat areas bounded by a visible edge (a card, a
@@ -504,6 +511,24 @@ function colorRegions(image: ImageData, shapeOf: Int32Array, rootOf: Int32Array,
     neighbors(p, (q) => {
       if (!steep && sameGroup(p, q) && data[q * 4 + 3] >= 128 && dist2(p, q) > EDGE * EDGE) steep = true;
     });
+    // In the middle of a small edge (a rounded corner's anti-aliasing between two close colors): its two
+    // opposite neighbors differ by an edge step though each differs from it by less. Gradients change far slower.
+    if (!steep) {
+      const x = p % width;
+      for (const [a, b] of [
+        [x > 0 ? p - 1 : -1, x < width - 1 ? p + 1 : -1],
+        [p - width, p + width],
+        [x > 0 ? p - width - 1 : -1, x < width - 1 ? p + width + 1 : -1],
+        [x < width - 1 ? p - width + 1 : -1, x > 0 ? p + width - 1 : -1],
+      ]) {
+        if (a < 0 || b < 0 || a >= n || b >= n || !sameGroup(p, a) || !sameGroup(p, b)) continue;
+        if (data[a * 4 + 3] < 128 || data[b * 4 + 3] < 128) continue;
+        if (dist2(a, b) > EDGE * EDGE) {
+          steep = true;
+          break;
+        }
+      }
+    }
     // A soft edge (blurred or scaled up) spreads its step over a few px, each too small to count:
     // look 2 px out too, but only across such a ramp (a sharp edge further on is its own pixels' business).
     if (!steep) {
@@ -561,8 +586,25 @@ function colorRegions(image: ImageData, shapeOf: Int32Array, rootOf: Int32Array,
     if (members.length < min) for (const p of members) of[p] = -2;
   };
 
-  // 2. Flat areas: connected flat pixels (smooth gradients chain along).
-  for (let p = 0; p < n; p++) if (of[p] === -1 && flat[p]) flood(p, (_, q) => flat[q] === 1, minFragment, false);
+  // 2. Flat areas: connected flat pixels (smooth gradients chain along, short fades don't).
+  const ref = new Float32Array(n * 3);
+  const setRef = (q: number, from: number, rate: number) => {
+    for (let k = 0; k < 3; k++) ref[q * 3 + k] = ref[from * 3 + k] + (data[q * 4 + k] - ref[from * 3 + k]) * rate;
+  };
+  const follows = (p: number, q: number) => {
+    if (flat[q] !== 1) return false;
+    const dr = data[q * 4] - ref[p * 3];
+    const dg = data[q * 4 + 1] - ref[p * 3 + 1];
+    const db = data[q * 4 + 2] - ref[p * 3 + 2];
+    if (dr * dr + dg * dg + db * db > DRIFT * DRIFT) return false;
+    setRef(q, p, DRIFT_RATE);
+    return true;
+  };
+  for (let p = 0; p < n; p++) {
+    if (of[p] !== -1 || !flat[p]) continue;
+    setRef(p, p, 1);
+    flood(p, follows, minFragment, false);
+  }
 
   // 3. Edge pixels next to flat parts are their blended rims when they're close to a touching part's
   //    local color, or a mix of the two parts they sit between (a letter's anti-aliased edge).

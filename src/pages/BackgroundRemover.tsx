@@ -16,11 +16,12 @@ import {
   loadImageFile,
   renderCutout,
   rgbToHex,
+  suggestTolerance,
   type RemovalOp,
   type RemovalSettings,
   type WorkingImage,
 } from '../utils/backgroundRemoval';
-import { IDENTITY_TRANSFORM, canvasToBlob, composeImage, contentBounds, hexToRgb, type ComposeOptions, type ImageTransform, type TextItem } from '../utils/imageCompose';
+import { IDENTITY_TRANSFORM, canvasToBlob, composeFrame, composeImage, contentBounds, hexToRgb, type ComposeOptions, type ImageTransform, type TextItem } from '../utils/imageCompose';
 import { buildCustomSvg } from '../utils/svgUtils';
 import { anchorIndex, inheritTransforms, segmentLayers, type LayerSet } from '../utils/imageLayers';
 import { svgToRaster } from '../utils/imageExport';
@@ -172,9 +173,16 @@ export default function BackgroundRemover() {
       setView('result');
       setSelected(null);
       const detected = estimateBackground(image);
+      const tolerance = detected ? suggestTolerance(image, detected, DEFAULT_SETTINGS.tolerance) : DEFAULT_SETTINGS.tolerance;
       // A new image starts a fresh history; the look (colors, background) carries over.
       resetHistory({
-        settings: { ...DEFAULT_SETTINGS, auto: !!detected },
+        settings: {
+          ...DEFAULT_SETTINGS,
+          auto: !!detected,
+          tolerance,
+          // A lowered tolerance means a flat UI screenshot: background-colored specks inside icons aren't letter holes.
+          removeHoles: tolerance === DEFAULT_SETTINGS.tolerance,
+        },
         ops: [],
         style: { ...styleRef.current, transform: IDENTITY_TRANSFORM, elements: [], splits: [], texts: [] },
       });
@@ -404,14 +412,9 @@ export default function BackgroundRemover() {
 
   const outputSize = useMemo(() => {
     if (!cutout || !bounds) return { width: 0, height: 0 };
-    const box = style.trim ? bounds : { w: cutout.width, h: cutout.height };
-    const pad = (Math.max(box.w, box.h) * style.padding) / 100;
-    let w = box.w + pad * 2;
-    let h = box.h + pad * 2;
-    if (style.square) w = h = Math.max(w, h);
-    const scale = style.size ? style.size / Math.max(w, h) : 1;
-    return { width: Math.round(w * scale), height: Math.round(h * scale) };
-  }, [cutout, bounds, style]);
+    const { width, height } = composeFrame(cutout, bounds, composeOptions);
+    return { width, height };
+  }, [cutout, bounds, composeOptions]);
 
   const pushOp = (op: RemovalOp) => {
     setState((st) => ({ ...st, ops: [...st.ops, op] }));
@@ -549,6 +552,10 @@ export default function BackgroundRemover() {
             onDeleteText={() => selectedText && deleteText(selectedText.id)}
             deletedCount={layerTransforms.filter((t) => t?.hidden).length}
             onStartEditing={() => setTool('edit')}
+            onStartErasing={() => {
+              setTool('remove');
+              setView('result');
+            }}
             canUndo={history.canUndo}
             canRedo={history.canRedo}
             editCount={ops.length}

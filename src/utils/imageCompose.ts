@@ -311,6 +311,37 @@ export function hexToRgb(hex: string): { r: number; g: number; b: number } | nul
   return null;
 }
 
+/** 0–255 RGB → [hue 0–1, saturation 0–1, lightness 0–1]. */
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d === 0) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const h = max === r ? ((g - b) / d + (g < b ? 6 : 0)) / 6 : max === g ? ((b - r) / d + 2) / 6 : ((r - g) / d + 4) / 6;
+  return [h, s, l];
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h * 6) % 2) - 1));
+  const m = l - c / 2;
+  const sector = Math.floor(h * 6) % 6;
+  const [r, g, b] = [
+    [c, x, 0],
+    [x, c, 0],
+    [0, c, x],
+    [0, x, c],
+    [x, 0, c],
+    [c, 0, x],
+  ][sector];
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
 // The recolor and edge passes touch every pixel, so their results are cached
 // per cut-out: dragging / rotating the subject then only re-draws.
 const sourceCache = new WeakMap<ImageData, { key: string; canvas: HTMLCanvasElement }>();
@@ -329,31 +360,36 @@ function preparedSource(cutout: ImageData, options: ComposeOptions): HTMLCanvasE
       tctx.fillStyle = tint;
       tctx.fillRect(0, 0, source.width, source.height);
     } else {
-      // Preserve detail mode: tint while maintaining contrast & white inner details
+      // Preserve detail: colored areas take the new hue at their own lightness (gradients stay gradients);
+      // neutral ones go from the exact color (black) to untouched white, so light backgrounds don't get a color wash.
       const imgData = tctx.getImageData(0, 0, source.width, source.height);
       const data = imgData.data;
       const rgb = hexToRgb(tint);
       if (rgb) {
-        const { r: tr, g: tg, b: tb } = rgb;
+        const [th, ts] = rgbToHsl(rgb.r, rgb.g, rgb.b);
         for (let i = 0; i < data.length; i += 4) {
-          const a = data[i + 3];
-          if (a < 8) continue;
+          if (data[i + 3] < 8) continue;
           const r = data[i];
           const g = data[i + 1];
           const b = data[i + 2];
           const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-          if (lum > 0.88) {
-            // Keep white/bright icon lines clean & clear
-            const factor = (lum - 0.88) / 0.12;
-            data[i] = Math.round(tr * (1 - factor) + 255 * factor);
-            data[i + 1] = Math.round(tg * (1 - factor) + 255 * factor);
-            data[i + 2] = Math.round(tb * (1 - factor) + 255 * factor);
+          // Near-white stays as it is (a darkness curve, so light grays barely change).
+          const dark = (1 - lum) ** 1.5;
+          const nr = 255 + (rgb.r - 255) * dark;
+          const ng = 255 + (rgb.g - 255) * dark;
+          const nb = 255 + (rgb.b - 255) * dark;
+          const chroma = (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
+          const w = Math.min(1, chroma / 0.25);
+          if (w > 0) {
+            const [, s, l] = rgbToHsl(r, g, b);
+            const [cr, cg, cb] = hslToRgb(th, Math.min(1, ts * Math.max(s, 0.35)), l);
+            data[i] = Math.round(nr + (cr - nr) * w);
+            data[i + 1] = Math.round(ng + (cg - ng) * w);
+            data[i + 2] = Math.round(nb + (cb - nb) * w);
           } else {
-            // Tint non-white regions while preserving lightness variation
-            const scale = lum * 0.7 + 0.3;
-            data[i] = Math.round(tr * scale);
-            data[i + 1] = Math.round(tg * scale);
-            data[i + 2] = Math.round(tb * scale);
+            data[i] = Math.round(nr);
+            data[i + 1] = Math.round(ng);
+            data[i + 2] = Math.round(nb);
           }
         }
         tctx.putImageData(imgData, 0, 0);
@@ -364,6 +400,24 @@ function preparedSource(cutout: ImageData, options: ComposeOptions): HTMLCanvasE
   return source;
 }
 
+/**
+ * Output canvas size: the drawn box plus padding, grown to fit the whole-image
+ * rotation so a turned image isn't cut off at the edges.
+ */
+export function composeFrame(cutout: { width: number; height: number }, bounds: Bounds | null, options: ComposeOptions) {
+  const box = options.trim && bounds ? bounds : { x: 0, y: 0, w: cutout.width, h: cutout.height };
+  const pad = (Math.max(box.w, box.h) * Math.min(Math.max(options.padding, 0), 45)) / 100;
+  const r = ((options.transform?.rotate ?? 0) * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(r));
+  const sin = Math.abs(Math.sin(r));
+  let innerW = box.w * cos + box.h * sin + pad * 2;
+  let innerH = box.w * sin + box.h * cos + pad * 2;
+  if (options.square) innerW = innerH = Math.max(innerW, innerH);
+
+  const scale = options.size ? options.size / Math.max(innerW, innerH) : 1;
+  return { box, scale, width: Math.max(1, Math.round(innerW * scale)), height: Math.max(1, Math.round(innerH * scale)) };
+}
+
 /** Renders into `target` (resized as needed) and returns the layout used. */
 export function composeImage(
   cutout: ImageData,
@@ -371,15 +425,7 @@ export function composeImage(
   options: ComposeOptions,
   target: HTMLCanvasElement = document.createElement('canvas'),
 ): { canvas: HTMLCanvasElement; layout: ComposeLayout } {
-  const box = options.trim && bounds ? bounds : { x: 0, y: 0, w: cutout.width, h: cutout.height };
-  const pad = (Math.max(box.w, box.h) * Math.min(Math.max(options.padding, 0), 45)) / 100;
-  let innerW = box.w + pad * 2;
-  let innerH = box.h + pad * 2;
-  if (options.square) innerW = innerH = Math.max(innerW, innerH);
-
-  const scale = options.size ? options.size / Math.max(innerW, innerH) : 1;
-  const width = Math.max(1, Math.round(innerW * scale));
-  const height = Math.max(1, Math.round(innerH * scale));
+  const { box, scale, width, height } = composeFrame(cutout, bounds, options);
   target.width = width;
   target.height = height;
   const ctx = target.getContext('2d')!;
